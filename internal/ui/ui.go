@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Env is the destination of everything tailport prints. Colour is enabled per
@@ -152,19 +153,40 @@ type Choice struct {
 	Manual bool
 }
 
+// labelWidth is the width of the widest label, so the notes that follow the
+// labels all start in the same column.
+func labelWidth(items []Choice) int {
+	width := 0
+	for _, item := range items {
+		if n := utf8.RuneCountInString(item.Label); n > width {
+			width = n
+		}
+	}
+	return width
+}
+
+// padLabel right aligns a label in a column of the given width.
+func padLabel(label string, width int) string {
+	if n := utf8.RuneCountInString(label); n < width {
+		return strings.Repeat(" ", width-n) + label
+	}
+	return label
+}
+
 // chooseLines is the fallback menu for input that is not a terminal: a numbered
 // list plus a line of input. The user may type a row number or type a
 // free-form value, which is returned verbatim when it is not a number. An empty
 // answer selects def.
 func (e *Env) chooseLines(title string, items []Choice, def int) (string, error) {
 	e.Title("%s", title)
+	pad := labelWidth(items)
 	for i, item := range items {
 		marker := "  "
 		if i+1 == def {
 			marker = e.Cyan("› ")
 		}
 		label := e.Bold(fmt.Sprintf("%2d", i+1))
-		row := fmt.Sprintf(" %s %s) %s", marker, label, item.Label)
+		row := fmt.Sprintf(" %s %s) %s", marker, label, padLabel(item.Label, pad))
 		if item.Note != "" {
 			row += "  " + e.Dim(item.Note)
 		}

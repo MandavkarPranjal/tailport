@@ -2,9 +2,11 @@ package ui
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestReadKey(t *testing.T) {
@@ -71,6 +73,7 @@ func runMenu(t *testing.T, input string, def int) (string, string, error) {
 	m := &menu{
 		env:     env,
 		in:      env.In,
+		fd:      -1,
 		title:   "Which port?",
 		items:   choices(),
 		cursor:  def - 1,
@@ -151,7 +154,7 @@ func TestMenuBackspace(t *testing.T) {
 	if got != "15" {
 		t.Errorf("backspace = %q, want 15", got)
 	}
-	if !strings.HasSuffix(out, "choice: 15\n") {
+	if !strings.HasSuffix(out, "choice: 15\r\n") {
 		t.Errorf("the prompt did not show the corrected value:\n%s", out)
 	}
 }
@@ -233,5 +236,166 @@ func TestChooseFallsBackWhenInputIsNotATerminal(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "j/k or arrows") {
 		t.Error("the keyboard menu was drawn for non-terminal input")
+	}
+}
+
+// frame returns one drawn frame of a menu with the given terminal width.
+func frame(t *testing.T, width int, items []Choice) string {
+	t.Helper()
+	return draw(t, width, 0, 0, items)
+}
+
+// draw renders one frame of a menu at a given terminal size and cursor row.
+func draw(t *testing.T, width, height, cursor int, items []Choice) string {
+	t.Helper()
+	var out bytes.Buffer
+	env := &Env{Out: &out, Err: io.Discard, In: strings.NewReader("")}
+	m := &menu{
+		env: env, in: env.In, fd: -1, title: "Which port?", items: items,
+		width: width, height: height, cursor: cursor, waitFor: "choice",
+	}
+	m.render()
+	return out.String()
+}
+
+// manyChoices is a menu longer than a small terminal.
+func manyChoices(n int) []Choice {
+	items := make([]Choice, 0, n)
+	for i := range n {
+		port := fmt.Sprintf("%d", 3000+i)
+		items = append(items, Choice{Label: port, Value: port})
+	}
+	return items
+}
+
+func TestFrameFitsTheTerminalHeight(t *testing.T) {
+	// A frame taller than the terminal cannot be redrawn in place, so the menu
+	// draws a window onto its rows instead.
+	items := manyChoices(20)
+	for _, cursor := range []int{0, 9, 19} {
+		out := draw(t, 0, 10, cursor, items)
+		if lines := strings.Count(out, "\n"); lines > 10 {
+			t.Errorf("cursor %d drew a %d line frame on a 10 line terminal", cursor, lines)
+		}
+		if want := fmt.Sprintf("> %2d)%s", cursor+1, items[cursor].Label); !strings.Contains(out, want) {
+			t.Errorf("cursor %d is not drawn in the frame, want %q:\n%s", cursor, want, out)
+		}
+		if !strings.Contains(out, "of 20") {
+			t.Errorf("a trimmed frame does not say how many rows there are:\n%s", out)
+		}
+	}
+}
+
+func TestFrameScrollsToKeepTheCursorVisible(t *testing.T) {
+	top := draw(t, 0, 10, 0, manyChoices(20))
+	if !strings.Contains(top, " 1)") || strings.Contains(top, "20)") {
+		t.Errorf("the first frame does not start at row 1:\n%s", top)
+	}
+	bottom := draw(t, 0, 10, 19, manyChoices(20))
+	if !strings.Contains(bottom, "20)") || strings.Contains(bottom, " 1)") {
+		t.Errorf("the last frame does not end at row 20:\n%s", bottom)
+	}
+}
+
+func TestFrameLinesEndWithCarriageReturn(t *testing.T) {
+	// Raw mode drops the terminal's newline translation, so a bare "\n" would
+	// step down without returning to the first column and every row would drift
+	// to the right.
+	out := frame(t, 0, choices())
+	if !strings.HasPrefix(out, "Which port?\r\n") {
+		t.Errorf("frame does not start with the title on its own line:\n%q", out)
+	}
+	if strings.Contains(strings.ReplaceAll(out, "\r\n", ""), "\n") {
+		t.Errorf("frame has a line that does not end in \\r\\n:\n%q", out)
+	}
+}
+
+func TestFrameReturnsToTheFirstColumnOnRedraw(t *testing.T) {
+	// ESC [ n A moves up but keeps the column, so the clear needs a carriage
+	// return of its own.
+	_, out, err := runMenu(t, "j\r", 1)
+	if err != nil {
+		t.Fatalf("run error: %v", err)
+	}
+	if !strings.Contains(out, "\x1b[6A\r\x1b[J") {
+		t.Errorf("redraw does not return to the first column:\n%q", out)
+	}
+}
+
+func TestFrameKeepsRowsOnOneLine(t *testing.T) {
+	const width = 30
+	out := frame(t, width, []Choice{
+		{Label: "3000", Note: "node (4242)"},
+		{Label: "5173", Note: "a very long process name that will not fit"},
+	})
+	for _, line := range strings.Split(strings.TrimSuffix(out, "\r\n"), "\r\n") {
+		if n := utf8.RuneCountInString(line); n > width-1 {
+			t.Errorf("line of %d columns overflows a %d column terminal: %q", n, width, line)
+		}
+	}
+	if !strings.Contains(out, "3000") || !strings.Contains(out, "5173") {
+		t.Errorf("a short row lost its label:\n%q", out)
+	}
+}
+
+func TestFrameLinesUpTheNotes(t *testing.T) {
+	// Ports are different widths, so the notes only line up if the labels are
+	// padded to a common column.
+	out := frame(t, 0, []Choice{
+		{Label: "53", Note: "127.0.0.1"},
+		{Label: "20241", Note: "cloudflared (4242)"},
+		{Label: "3000", Note: "node"},
+	})
+	notes := []string{"127.0.0.1", "cloudflared (4242)", "node"}
+	rows := rowsOf(out)
+	if len(rows) != len(notes) {
+		t.Fatalf("frame drew %d rows, want %d:\n%q", len(rows), len(notes), out)
+	}
+	want := -1
+	for i, row := range rows {
+		got := strings.Index(row, notes[i])
+		if got < 0 {
+			t.Fatalf("row %q is missing the note %q", row, notes[i])
+		}
+		if want < 0 {
+			want = got
+		}
+		if got != want {
+			t.Errorf("note in %q starts at column %d, want %d", row, got, want)
+		}
+	}
+}
+
+// rowsOf returns the numbered rows of a frame.
+func rowsOf(frame string) []string {
+	var rows []string
+	for _, line := range strings.Split(frame, "\r\n") {
+		if strings.Contains(line, ")") {
+			rows = append(rows, line)
+		}
+	}
+	return rows
+}
+
+func TestFrameAlignsRows(t *testing.T) {
+	// The highlighted row starts with "> " instead of two spaces, so its number
+	// has to line up with the others one column further right.
+	const wantColumn = 4
+	for _, row := range rowsOf(frame(t, 0, choices())) {
+		if got := strings.Index(row, ")"); got != wantColumn {
+			t.Errorf("row %q has its number at column %d, want %d", row, got, wantColumn)
+		}
+	}
+}
+
+func TestCutKeepsWholeRunes(t *testing.T) {
+	if got := cut("héllo", 2); got != "hé" {
+		t.Errorf("cut = %q, want hé", got)
+	}
+	if got := cut("héllo", 99); got != "héllo" {
+		t.Errorf("cut past the end = %q, want the whole string", got)
+	}
+	if got := cut("héllo", 0); got != "" {
+		t.Errorf("cut to nothing = %q, want an empty string", got)
 	}
 }

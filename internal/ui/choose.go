@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/term"
 )
@@ -68,21 +69,29 @@ func (e *Env) chooseKeys(file *os.File, title string, items []Choice, def int) (
 	m := &menu{
 		env:     e,
 		in:      file,
+		fd:      fd,
 		title:   title,
 		items:   items,
 		cursor:  def - 1,
 		drawn:   0,
 		waitFor: "choice",
 	}
+	m.refreshSize()
 	return m.run()
 }
 
 // menu holds the state of the keyboard driven selection.
 type menu struct {
-	env   *Env
-	in    io.Reader
-	title string
-	items []Choice
+	env *Env
+	in  io.Reader
+	// fd is the terminal the menu draws on; negative means there is none. stdin
+	// is 0, so zero is a real terminal here.
+	fd int
+	// width and height are the terminal size, used to keep the frame on screen.
+	width  int
+	height int
+	title  string
+	items  []Choice
 	// cursor is the highlighted row, 0-based.
 	cursor int
 	// typed is what the user has typed so far, shown as a port.
@@ -183,49 +192,191 @@ func (m *menu) accept() (value string, done bool, err error) {
 }
 
 // render draws one frame, overwriting the last one in place.
+//
+// Every line ends in an explicit carriage return because raw mode turns off the
+// terminal's newline translation, so a bare "\n" would only step down a row and
+// every line would land further right than the one before it. Rows are cut at
+// the terminal width so nothing wraps, which is what lets the next frame move
+// back up by an exact number of lines.
 func (m *menu) render() {
+	m.refreshSize()
 	if m.drawn > 0 {
-		fmt.Fprintf(m.env.Out, "\x1b[%dA\x1b[J", m.drawn)
+		fmt.Fprintf(m.env.Out, "\x1b[%dA\r\x1b[J", m.drawn)
 	}
 
 	var frame strings.Builder
-	fmt.Fprintf(&frame, "%s\n", m.env.Bold(m.title))
-	fmt.Fprintf(&frame, "  %s\n", m.env.Dim("j/k or arrows to move, enter to share, q to quit"))
-	for i, item := range m.items {
-		marker := "  "
-		label := m.env.Dim(fmt.Sprintf("%2d", i+1))
-		text := item.Label
+	pad := labelWidth(m.items)
+	start, rows := m.window()
+	m.writeLine(&frame, m.titleSegments(start, rows)...)
+	m.writeLine(&frame, segment{navHint, styleDim})
+	for i := start; i < start+rows; i++ {
+		item := m.items[i]
+		marker := segment{"  ", stylePlain}
+		number := segment{fmt.Sprintf("%2d)", i+1), styleDim}
+		label := segment{padLabel(item.Label, pad), stylePlain}
 		if i == m.cursor {
-			marker = m.env.Cyan("> ")
-			label = m.env.Bold(fmt.Sprintf("%2d", i+1))
-			text = m.env.Cyan(item.Label)
+			marker = segment{"> ", styleCyan}
+			number = segment{fmt.Sprintf("%2d)", i+1), styleBold}
+			label = segment{padLabel(item.Label, pad), styleCyan}
 		}
-		fmt.Fprintf(&frame, "%s %s) %s", marker, label, text)
+		segs := []segment{marker, number, label}
 		if item.Note != "" {
-			fmt.Fprintf(&frame, "  %s", m.env.Dim(item.Note))
+			segs = append(segs, segment{"  " + item.Note, styleDim})
 		}
 		if item.Manual {
-			fmt.Fprintf(&frame, "  %s", m.env.Dim("(type a port)"))
+			segs = append(segs, segment{"  (type a port)", styleDim})
 		}
-		frame.WriteString("\n")
+		m.writeLine(&frame, segs...)
 	}
 	if m.hint != "" {
-		fmt.Fprintf(&frame, "  %s\n", m.env.Yellow(m.hint))
+		m.writeLine(&frame, segment{"  " + m.hint, styleYellow})
 	}
-	fmt.Fprintf(&frame, "  %s\n", m.prompt())
+	m.writeLine(&frame, m.prompt()...)
 
 	out := frame.String()
 	fmt.Fprint(m.env.Out, out)
 	m.drawn = strings.Count(out, "\n")
 }
 
+// frameChrome is the number of lines the frame spends on the title, the key map,
+// an optional hint, and the prompt, plus a spare line. Keeping the spare line
+// means a frame is always shorter than the terminal, so drawing it never
+// scrolls and the next frame can always move back up by the full line count.
+const frameChrome = 5
+
+// minVisibleRows is how many rows are drawn on a terminal too short for the
+// whole menu.
+const minVisibleRows = 3
+
+// window returns the range of rows to draw, which is a window onto the items
+// when there are more of them than the terminal has lines. A frame taller than
+// the terminal could not be redrawn in place, so it has to be trimmed.
+func (m *menu) window() (start, rows int) {
+	rows = len(m.items)
+	if m.height > 0 {
+		room := m.height - frameChrome
+		if room < minVisibleRows {
+			room = minVisibleRows
+		}
+		if room < rows {
+			rows = room
+		}
+	}
+	start = 0
+	if m.cursor >= start+rows {
+		start = m.cursor - rows + 1
+	}
+	return start, rows
+}
+
+// titleSegments is the title, followed by the visible row range when the menu
+// is taller than the terminal. It goes on the title line because that line is
+// short enough to survive a narrow terminal, where the key map would be cut.
+func (m *menu) titleSegments(start, rows int) []segment {
+	segs := []segment{{m.title, styleBold}}
+	if rows < len(m.items) {
+		segs = append(segs, segment{fmt.Sprintf("   %d-%d of %d", start+1, start+rows, len(m.items)), styleDim})
+	}
+	return segs
+}
+
+// navHint is the one-line key map shown under the title.
+const navHint = "j/k or arrows to move, enter to share, q to quit"
+
+// style says how one piece of a frame line is painted.
+type style int
+
+const (
+	stylePlain style = iota
+	styleBold
+	styleDim
+	styleCyan
+	styleYellow
+)
+
+// segment is one piece of a frame line: the text as measured, and how to paint
+// it. Keeping the two apart is what lets a line be trimmed to the terminal
+// width before any escape sequence is written.
+type segment struct {
+	text  string
+	style style
+}
+
+// writeLine appends one frame line, trimmed so it cannot wrap.
+func (m *menu) writeLine(sb *strings.Builder, segs ...segment) {
+	limit := 0
+	if m.width > 2 {
+		limit = m.width - 1
+	}
+
+	used := 0
+	for _, s := range segs {
+		text := s.text
+		if limit > 0 && len(text) > limit-used {
+			text = cut(text, limit-used)
+		}
+		used += utf8.RuneCountInString(text)
+		sb.WriteString(paint(m.env, s.style, text))
+	}
+	sb.WriteString("\r\n")
+}
+
+// refreshSize re-reads the terminal size, so a resize mid-menu is picked up.
+func (m *menu) refreshSize() {
+	if m.fd < 0 {
+		return
+	}
+	if w, h, err := term.GetSize(m.fd); err == nil {
+		if w > 0 {
+			m.width = w
+		}
+		if h > 0 {
+			m.height = h
+		}
+	}
+}
+
+// paint wraps text in the escape codes for s.
+func paint(e *Env, s style, text string) string {
+	switch s {
+	case styleBold:
+		return e.Bold(text)
+	case styleDim:
+		return e.Dim(text)
+	case styleCyan:
+		return e.Cyan(text)
+	case styleYellow:
+		return e.Yellow(text)
+	}
+	return text
+}
+
+// cut shortens s to at most n runes without splitting one.
+func cut(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i]
+		}
+		count++
+	}
+	return s
+}
+
 // prompt is the input line under the menu.
-func (m *menu) prompt() string {
+func (m *menu) prompt() []segment {
 	label := "choice"
 	if m.waitFor == "port" {
 		label = "port"
 	}
-	return fmt.Sprintf("%s %s", m.env.Dim(label+":"), strings.TrimSpace(string(m.typed)))
+	return []segment{
+		{"  ", stylePlain},
+		{label + ": ", styleDim},
+		{string(m.typed), stylePlain},
+	}
 }
 
 // readKey decodes one key press from raw terminal input. Arrow keys arrive as
