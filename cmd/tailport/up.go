@@ -201,25 +201,11 @@ func resolvePort(env *ui.Env, port int, yes bool) (int, error) {
 	}
 	items = append(items, ui.Choice{Label: "other", Note: "type a different port", Manual: true})
 
-	answer, err := env.Choose("Which local port should I share?", items, defaultRow(listeners))
+	answer, err := env.Choose("Which local port should I share?", items, 1)
 	if err != nil {
 		return 0, fmt.Errorf("%w (%w)", errNoPortSelected, err)
 	}
 	return parsePort(answer)
-}
-
-// defaultRow points the menu at the first socket a local program owns on
-// loopback, which is nearly always the dev server the user means.
-func defaultRow(listeners []netports.Listener) int {
-	for i, l := range listeners {
-		if i >= maxMenuRows {
-			break
-		}
-		if l.Process != "" && l.Loopback {
-			return i + 1
-		}
-	}
-	return 1
 }
 
 func parsePort(answer string) (int, error) {

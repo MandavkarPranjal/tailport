@@ -53,7 +53,9 @@ tailport list                     # ports on this machine that can be shared
 
 In the menu, `j` and `k` or the arrow keys move the highlight, `enter` shares
 what is highlighted, `g` and `G` jump to the top and bottom, `q` quits, and
-typing digits picks a row or gives a port directly.
+typing digits picks a row or gives a port directly. `/` filters the rows as you
+type, matching the port, the process name or the address; while filtering, the
+arrow keys move between the matches and `esc` clears the filter.
 
 Sharing runs in the foreground and stops with Ctrl-C. With `-d` tailport
 re-executes itself in the background, records itself so `status` and `stop` can

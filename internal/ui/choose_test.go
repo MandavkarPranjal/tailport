@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -27,11 +28,11 @@ func TestReadKey(t *testing.T) {
 		{name: "digit", input: "3", want: key{kind: keyRune, r: '3'}},
 		{name: "space", input: " ", want: key{kind: keyRune, r: ' '}},
 		{name: "backspace", input: "\x7f", want: key{kind: keyRune, r: 0x7f}},
-		{name: "bare escape is ignored", input: "\x1b", want: key{kind: keyRune}},
+		{name: "bare escape", input: "\x1b", want: key{kind: keyEscape}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := readKey(strings.NewReader(tt.input))
+			got, err := readKey(bufio.NewReader(strings.NewReader(tt.input)))
 			if err != nil {
 				t.Fatalf("readKey(%q) error: %v", tt.input, err)
 			}
@@ -43,13 +44,13 @@ func TestReadKey(t *testing.T) {
 }
 
 func TestReadKeyOnClosedInput(t *testing.T) {
-	if _, err := readKey(strings.NewReader("")); err == nil {
+	if _, err := readKey(bufio.NewReader(strings.NewReader(""))); err == nil {
 		t.Error("readKey on empty input = nil error, want an error")
 	}
 }
 
 func TestReadKeyReadsOneKeyAtATime(t *testing.T) {
-	r := strings.NewReader("jj\r")
+	r := bufio.NewReader(strings.NewReader("jj\r"))
 	first, err := readKey(r)
 	if err != nil || first.r != 'j' {
 		t.Fatalf("first readKey = %+v, %v, want j", first, err)
@@ -68,17 +69,25 @@ func TestReadKeyReadsOneKeyAtATime(t *testing.T) {
 // terminal, which is what menu.run does once the terminal is in raw mode.
 func runMenu(t *testing.T, input string, def int) (string, string, error) {
 	t.Helper()
+	return runMenuItems(t, input, def, choices())
+}
+
+// runMenuItems is runMenu with a menu of the caller's choosing.
+func runMenuItems(t *testing.T, input string, def int, items []Choice) (string, string, error) {
+	t.Helper()
 	var out bytes.Buffer
 	env := &Env{Out: &out, Err: io.Discard, In: strings.NewReader(input)}
 	m := &menu{
 		env:     env,
-		in:      env.In,
+		in:      bufio.NewReader(env.In),
 		fd:      -1,
 		title:   "Which port?",
-		items:   choices(),
+		items:   items,
 		cursor:  def - 1,
+		restore: -1,
 		waitFor: "choice",
 	}
+	m.refilter()
 	value, err, _ := m.run()
 	return value, out.String(), err
 }
@@ -216,10 +225,193 @@ func TestMenuNeverComplainsAboutAPort(t *testing.T) {
 
 func TestMenuShowsHowToNavigate(t *testing.T) {
 	_, out, _ := runMenu(t, "\r", 1)
-	for _, want := range []string{"j/k or arrows", "enter to share", "q to quit"} {
+	for _, want := range []string{"j/k or arrows", "/ to search", "enter to share", "q to quit"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("menu does not explain %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestMenuSearchFiltersRows(t *testing.T) {
+	// "/" then the process name leaves just the row that runs python3, and enter
+	// takes it.
+	got, out, err := runMenu(t, "/python\r", 1)
+	if err != nil {
+		t.Fatalf("run error: %v", err)
+	}
+	if got != "5173" {
+		t.Errorf("search for python = %q, want 5173", got)
+	}
+	if !strings.Contains(out, "search: python") {
+		t.Errorf("the prompt does not show the query:\n%s", out)
+	}
+	if !strings.Contains(out, "type to filter") {
+		t.Errorf("the key map does not change while searching:\n%s", out)
+	}
+}
+
+func TestMenuSearchMatchesThePortTheProcessAndTheNote(t *testing.T) {
+	// The port, the process name and the note all count, since the user may be
+	// looking for any of them.
+	for _, tt := range []struct{ query, want string }{
+		{query: "3000", want: "3000"},
+		{query: "NODE", want: "3000"},
+		{query: "42", want: "3000"},
+	} {
+		if got, _, err := runMenu(t, "/"+tt.query+"\r", 1); err != nil || got != tt.want {
+			t.Errorf("search for %q = %q, %v, want %s", tt.query, got, err, tt.want)
+		}
+	}
+}
+
+func TestMenuSearchMovesWithinTheMatches(t *testing.T) {
+	// Two rows are called node, so the arrow keys move between the matches. The
+	// letter keys cannot, because while searching they are part of the query.
+	if got, _, err := runMenuItems(t, "/node\x1b[B\r", 1, searchChoices()); err != nil || got != "8080" {
+		t.Errorf("down arrow inside a search = %q, %v, want 8080", got, err)
+	}
+}
+
+func TestMenuSearchLettersGoIntoTheQuery(t *testing.T) {
+	// j and k are query characters while searching, not navigation, so they end
+	// up in the prompt instead of moving the highlight.
+	_, out, _ := runMenu(t, "/jk", 1)
+	if got := lastFrame(out); !strings.Contains(got, "search: jk") {
+		t.Errorf("the query did not swallow the navigation keys:\n%s", got)
+	}
+}
+
+func TestMenuSearchIgnoresCaseAndSurroundingSpaces(t *testing.T) {
+	if got, _, err := runMenuItems(t, "/  node  \r", 1, searchChoices()); err != nil || got != "3000" {
+		t.Errorf("search for padded node = %q, %v, want 3000", got, err)
+	}
+}
+
+func TestMenuSearchBackspaceWidensTheMatches(t *testing.T) {
+	// Emptying the query puts every row back, with the highlight on the first.
+	got, _, err := runMenuItems(t, "/node\b\b\b\x1b[B\r", 1, searchChoices())
+	if err != nil || got != "5173" {
+		t.Errorf("backspacing the query = %q, %v, want 5173", got, err)
+	}
+}
+
+func TestMenuSearchEscapeGoesBack(t *testing.T) {
+	// Escape drops the filter, so the digits typed next count as a row again.
+	got, out, err := runMenu(t, "/python\x1b1\r", 2)
+	if err != nil {
+		t.Fatalf("run error: %v", err)
+	}
+	if got != "3000" {
+		t.Errorf("escape then typing 1 = %q, want row 1 (3000)", got)
+	}
+	if !strings.Contains(lastFrame(out), "choice: 1") {
+		t.Errorf("the prompt is still asking for a search:\n%s", lastFrame(out))
+	}
+}
+
+func TestMenuSearchEscapePutsTheHighlightBack(t *testing.T) {
+	got, _, err := runMenu(t, "j/python\x1b\r", 1)
+	if err != nil {
+		t.Fatalf("run error: %v", err)
+	}
+	if got != "5173" {
+		t.Errorf("escape from a search = %q, want the row it started on, 5173", got)
+	}
+}
+
+func TestMenuSearchKeepsGoingWhenNothingMatches(t *testing.T) {
+	// Enter must not end the menu when there is nothing to take, and the frame
+	// has to say why the list is empty.
+	_, out, err := runMenu(t, "/zzzz\r", 1)
+	if err == nil {
+		t.Error("menu accepted an empty result set")
+	}
+	if !strings.Contains(out, "nothing matches") {
+		t.Errorf("an empty result set is not explained:\n%s", out)
+	}
+	if !strings.Contains(out, "0 of 3") {
+		t.Errorf("an empty result set does not report the counts:\n%s", out)
+	}
+	if !strings.HasSuffix(out, "search: zzzz\r\n") {
+		t.Errorf("the search prompt lost the query:\n%q", out)
+	}
+}
+
+func TestMenuSearchReportsHowManyRowsMatch(t *testing.T) {
+	_, out, _ := runMenuItems(t, "/node", 1, searchChoices())
+	if !strings.Contains(out, "2 of 4") {
+		t.Errorf("the title does not report the match count:\n%s", out)
+	}
+}
+
+func TestMenuSearchQueryCanReachThePortPrompt(t *testing.T) {
+	// The manual row survives a search, so it still asks for a port, and asking
+	// for one ends the search.
+	got, out, err := runMenu(t, "/type\r5173\r", 1)
+	if err != nil {
+		t.Fatalf("run error: %v", err)
+	}
+	if got != "5173" {
+		t.Errorf("search then the manual row = %q, want the typed 5173", got)
+	}
+	if !strings.Contains(out, "port: 5173") {
+		t.Errorf("the manual row did not prompt for a port:\n%s", out)
+	}
+	if strings.Contains(lastFrame(out), "search: ") {
+		t.Errorf("the menu is still searching while asking for a port:\n%s", lastFrame(out))
+	}
+}
+
+func TestMenuSearchNumbersRowsFromOne(t *testing.T) {
+	// A filtered list is numbered from one, so its numbers and its row range
+	// always agree with each other.
+	_, out, _ := runMenu(t, "/type", 1)
+	if got := lastFrame(out); !strings.Contains(got, "1)other") {
+		t.Errorf("a filtered row is not numbered from one:\n%s", got)
+	}
+	if got := lastFrame(out); strings.Contains(got, "3000") {
+		t.Errorf("a filtered out row is still drawn:\n%s", got)
+	}
+}
+
+func TestMenuSearchKeepsTheRowRangeWhenFiltering(t *testing.T) {
+	// A search that matches more rows than the terminal has lines still has to
+	// scroll, and still has to say so.
+	items := manyChoices(20)
+	var out bytes.Buffer
+	env := &Env{Out: &out, Err: io.Discard, In: strings.NewReader("30")}
+	m := &menu{env: env, in: bufio.NewReader(env.In), fd: -1, title: "Which port?", items: items,
+		height: 10, cursor: 0, restore: -1, waitFor: "choice"}
+	m.query = []rune("301")
+	m.searching = true
+	m.refilter()
+	m.render()
+	if lines := strings.Count(out.String(), "\n"); lines > 10 {
+		t.Errorf("a filtered frame is %d lines tall on a 10 line terminal", lines)
+	}
+	if !strings.Contains(out.String(), "1-5 of 10") {
+		t.Errorf("the frame does not say how many rows there are:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "3000") {
+		t.Errorf("a row that does not match is still drawn:\n%s", out.String())
+	}
+}
+
+func TestMenuEscapeOutsideASearchChangesNothing(t *testing.T) {
+	// Escape is only meaningful in a search, so it must not move the highlight.
+	if got, _, err := runMenu(t, "\x1bj\r", 1); err != nil || got != "5173" {
+		t.Errorf("escape then j = %q, %v, want 5173", got, err)
+	}
+}
+
+// searchChoices is a menu with two rows that share a process name, so a search
+// has more than one match to move between.
+func searchChoices() []Choice {
+	return []Choice{
+		{Label: "3000", Note: "node (42)", Value: "3000"},
+		{Label: "5173", Note: "python3 (43)", Value: "5173"},
+		{Label: "8080", Note: "node (44)", Value: "8080"},
+		{Label: "other", Note: "type a different port", Manual: true},
 	}
 }
 
@@ -251,9 +443,10 @@ func draw(t *testing.T, width, height, cursor int, items []Choice) string {
 	var out bytes.Buffer
 	env := &Env{Out: &out, Err: io.Discard, In: strings.NewReader("")}
 	m := &menu{
-		env: env, in: env.In, fd: -1, title: "Which port?", items: items,
-		width: width, height: height, cursor: cursor, waitFor: "choice",
+		env: env, in: bufio.NewReader(env.In), fd: -1, title: "Which port?", items: items,
+		width: width, height: height, cursor: cursor, restore: -1, waitFor: "choice",
 	}
+	m.refilter()
 	m.render()
 	return out.String()
 }
@@ -364,6 +557,13 @@ func TestFrameLinesUpTheNotes(t *testing.T) {
 			t.Errorf("note in %q starts at column %d, want %d", row, got, want)
 		}
 	}
+}
+
+// lastFrame is the frame the user is left looking at, which is the one drawn
+// after the final redraw.
+func lastFrame(out string) string {
+	frames := strings.Split(out, "\x1b[J")
+	return frames[len(frames)-1]
 }
 
 // rowsOf returns the numbered rows of a frame.

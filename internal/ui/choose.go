@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,8 @@ const (
 	keyDown
 	// keyEnter accepts the current selection.
 	keyEnter
+	// keyEscape cancels a search, or does nothing at all.
+	keyEscape
 	// keyQuit abandons the menu.
 	keyQuit
 )
@@ -37,9 +40,10 @@ type key struct {
 // Choose draws the selection menu and returns the value the user settled on.
 //
 // On a real terminal the menu is keyboard driven: j and k and the arrow keys
-// move the highlight, enter accepts it, and typing digits gives a port directly.
-// When the input is a pipe, a file, or a test buffer, it falls back to a plain
-// numbered prompt so scripts and pipes still work.
+// move the highlight, / filters the rows as you type, enter accepts the
+// highlight, and typing digits gives a port directly. When the input is a pipe,
+// a file, or a test buffer, it falls back to a plain numbered prompt so scripts
+// and pipes still work.
 func (e *Env) Choose(title string, items []Choice, def int) (string, error) {
 	if def < 1 {
 		def = 1
@@ -68,7 +72,7 @@ func (e *Env) chooseKeys(file *os.File, title string, items []Choice, def int) (
 
 	m := &menu{
 		env:     e,
-		in:      file,
+		in:      bufio.NewReader(file),
 		fd:      fd,
 		title:   title,
 		items:   items,
@@ -76,6 +80,8 @@ func (e *Env) chooseKeys(file *os.File, title string, items []Choice, def int) (
 		drawn:   0,
 		waitFor: "choice",
 	}
+	m.refilter()
+	m.restore = -1
 	m.refreshSize()
 	return m.run()
 }
@@ -83,7 +89,7 @@ func (e *Env) chooseKeys(file *os.File, title string, items []Choice, def int) (
 // menu holds the state of the keyboard driven selection.
 type menu struct {
 	env *Env
-	in  io.Reader
+	in  keyReader
 	// fd is the terminal the menu draws on; negative means there is none. stdin
 	// is 0, so zero is a real terminal here.
 	fd int
@@ -92,8 +98,18 @@ type menu struct {
 	height int
 	title  string
 	items  []Choice
-	// cursor is the highlighted row, 0-based.
+	// view is the items the menu is currently offering, as indexes into items.
+	// It is every item until a search narrows it down.
+	view []int
+	// cursor is the highlighted row of the view, 0-based.
 	cursor int
+	// searching is true while the user is filtering with /.
+	searching bool
+	// restore is the item the highlight sat on when a search started, so escape
+	// can put it back. It is -1 when no search has been started.
+	restore int
+	// query is what has been typed into the search so far.
+	query []rune
 	// typed is what the user has typed so far, shown as a port.
 	typed []rune
 	// waitFor is which prompt the menu is showing: "choice" or "port".
@@ -116,6 +132,9 @@ func (m *menu) run() (string, error, bool) {
 		switch k.kind {
 		case keyQuit:
 			return "", fmt.Errorf("no selection made"), true
+		case keyEscape:
+			m.hint = ""
+			m.endSearch()
 		case keyUp:
 			m.hint = ""
 			m.move(-1)
@@ -129,40 +148,134 @@ func (m *menu) run() (string, error, bool) {
 			}
 		case keyRune:
 			m.hint = ""
-			switch k.r {
-			case 'j':
-				m.move(1)
-			case 'k':
-				m.move(-1)
-			case 'g':
-				m.cursor = 0
-			case 'G':
-				m.cursor = len(m.items) - 1
-			case 'q':
+			if m.rune(k.r) {
 				return "", fmt.Errorf("no selection made"), true
-			case '\b', 0x7f:
-				if n := len(m.typed); n > 0 {
-					m.typed = m.typed[:n-1]
-				}
-			default:
-				m.typed = append(m.typed, k.r)
 			}
 		}
 	}
 }
 
-// move shifts the highlight, wrapping around so j at the bottom lands on top.
-func (m *menu) move(delta int) {
-	if len(m.items) == 0 {
+// rune handles one printable key, or a control key the terminal sent as a rune.
+// It reports true when the key asked to leave the menu.
+func (m *menu) rune(r rune) bool {
+	if m.searching {
+		m.searchRune(r)
+		return false
+	}
+	switch r {
+	case 'j':
+		m.move(1)
+	case 'k':
+		m.move(-1)
+	case 'g':
+		m.cursor = 0
+	case 'G':
+		m.cursor = len(m.view) - 1
+	case '/':
+		m.restore = m.highlighted()
+		m.searching = true
+		m.query = nil
+		m.refilter()
+	case 'q':
+		return true
+	case '\b', 0x7f:
+		if n := len(m.typed); n > 0 {
+			m.typed = m.typed[:n-1]
+		}
+	default:
+		m.typed = append(m.typed, r)
+	}
+	return false
+}
+
+// searchRune edits the search query. Every key is part of the query while a
+// search is running, including the ones that navigate or quit outside one.
+func (m *menu) searchRune(r rune) {
+	switch r {
+	case '\b', 0x7f:
+		if n := len(m.query); n > 0 {
+			m.query = m.query[:n-1]
+		}
+	default:
+		m.query = append(m.query, r)
+	}
+	m.refilter()
+}
+
+// endSearch drops the filter and goes back to offering every row, with the
+// highlight back where the search found it.
+func (m *menu) endSearch() {
+	if !m.searching {
 		return
 	}
-	m.cursor = (m.cursor + delta + len(m.items)) % len(m.items)
+	m.searching = false
+	m.query = nil
+	m.refilter()
+	if m.restore >= 0 {
+		for i, item := range m.view {
+			if item == m.restore {
+				m.cursor = i
+				break
+			}
+		}
+	}
+}
+
+// highlighted is the item the cursor is on, or -1 when there is no row at all.
+func (m *menu) highlighted() int {
+	if m.cursor < 0 || m.cursor >= len(m.view) {
+		return -1
+	}
+	return m.view[m.cursor]
+}
+
+// refilter rebuilds the view from the search query and keeps the highlight on a
+// row that still exists.
+func (m *menu) refilter() {
+	query := strings.ToLower(strings.TrimSpace(string(m.query)))
+	view := make([]int, 0, len(m.items))
+	for i, item := range m.items {
+		if query == "" || matches(item, query) {
+			view = append(view, i)
+		}
+	}
+	m.view = view
+	if m.cursor >= len(m.view) {
+		m.cursor = len(m.view) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+}
+
+// matches reports whether a row contains the search query, ignoring case. The
+// port, the process name and the address are all fair game, since the user may
+// be looking for any of them.
+func matches(item Choice, query string) bool {
+	for _, field := range []string{item.Label, item.Note, item.Value} {
+		if strings.Contains(strings.ToLower(field), query) {
+			return true
+		}
+	}
+	return false
+}
+
+// move shifts the highlight, wrapping around so j at the bottom lands on top.
+func (m *menu) move(delta int) {
+	if len(m.view) == 0 {
+		return
+	}
+	m.cursor = (m.cursor + delta + len(m.view)) % len(m.view)
 }
 
 // accept resolves the current selection. It reports done when the menu is over,
 // and an error only when it cannot continue.
 func (m *menu) accept() (value string, done bool, err error) {
-	if len(m.items) == 0 {
+	if len(m.view) == 0 {
+		if m.searching {
+			// Nothing matches yet, so keep filtering rather than dying on it.
+			return "", false, nil
+		}
 		return "", false, fmt.Errorf("nothing to choose from")
 	}
 
@@ -184,11 +297,13 @@ func (m *menu) accept() (value string, done bool, err error) {
 		return typed, true, nil
 	}
 
-	if m.items[m.cursor].Manual {
+	item := m.items[m.view[m.cursor]]
+	if item.Manual {
 		m.waitFor = "port"
+		m.endSearch()
 		return "", false, nil
 	}
-	return m.items[m.cursor].Value, true, nil
+	return item.Value, true, nil
 }
 
 // render draws one frame, overwriting the last one in place.
@@ -208,9 +323,9 @@ func (m *menu) render() {
 	pad := labelWidth(m.items)
 	start, rows := m.window()
 	m.writeLine(&frame, m.titleSegments(start, rows)...)
-	m.writeLine(&frame, segment{navHint, styleDim})
+	m.writeLine(&frame, segment{m.navLine(), styleDim})
 	for i := start; i < start+rows; i++ {
-		item := m.items[i]
+		item := m.items[m.view[i]]
 		marker := segment{"  ", stylePlain}
 		number := segment{fmt.Sprintf("%2d)", i+1), styleDim}
 		label := segment{padLabel(item.Label, pad), stylePlain}
@@ -227,6 +342,9 @@ func (m *menu) render() {
 			segs = append(segs, segment{"  (type a port)", styleDim})
 		}
 		m.writeLine(&frame, segs...)
+	}
+	if len(m.view) == 0 {
+		m.writeLine(&frame, segment{fmt.Sprintf("  nothing matches %q", string(m.query)), styleYellow})
 	}
 	if m.hint != "" {
 		m.writeLine(&frame, segment{"  " + m.hint, styleYellow})
@@ -252,7 +370,7 @@ const minVisibleRows = 3
 // when there are more of them than the terminal has lines. A frame taller than
 // the terminal could not be redrawn in place, so it has to be trimmed.
 func (m *menu) window() (start, rows int) {
-	rows = len(m.items)
+	rows = len(m.view)
 	if m.height > 0 {
 		room := m.height - frameChrome
 		if room < minVisibleRows {
@@ -270,18 +388,37 @@ func (m *menu) window() (start, rows int) {
 }
 
 // titleSegments is the title, followed by the visible row range when the menu
-// is taller than the terminal. It goes on the title line because that line is
-// short enough to survive a narrow terminal, where the key map would be cut.
+// is taller than the terminal, or by the match count while searching. Rows are
+// numbered from one within whatever the menu is offering, so a filtered list
+// reads the same way as the whole one. It goes
+// on the title line because that line is short enough to survive a narrow
+// terminal, where the key map would be cut.
 func (m *menu) titleSegments(start, rows int) []segment {
 	segs := []segment{{m.title, styleBold}}
-	if rows < len(m.items) {
-		segs = append(segs, segment{fmt.Sprintf("   %d-%d of %d", start+1, start+rows, len(m.items)), styleDim})
+	switch {
+	case rows < len(m.view) && len(m.view) > 0:
+		segs = append(segs, segment{fmt.Sprintf("   %d-%d of %d", start+1, start+rows, len(m.view)), styleDim})
+	case m.searching && len(m.view) != len(m.items):
+		segs = append(segs, segment{fmt.Sprintf("   %d of %d", len(m.view), len(m.items)), styleDim})
 	}
 	return segs
 }
 
 // navHint is the one-line key map shown under the title.
-const navHint = "j/k or arrows to move, enter to share, q to quit"
+const navHint = "j/k or arrows to move, / to search, enter to share, q to quit"
+
+// searchHint replaces the key map while a search is running, because the keys
+// mean something different there: every letter is part of the query, so the
+// arrows are what move between the matches.
+const searchHint = "type to filter, up/down to move, enter to share, esc to cancel"
+
+// navLine is whichever key map fits the moment.
+func (m *menu) navLine() string {
+	if m.searching {
+		return searchHint
+	}
+	return navHint
+}
 
 // style says how one piece of a frame line is painted.
 type style int
@@ -368,21 +505,31 @@ func cut(s string, n int) string {
 
 // prompt is the input line under the menu.
 func (m *menu) prompt() []segment {
-	label := "choice"
-	if m.waitFor == "port" {
+	label, text := "choice", string(m.typed)
+	if m.searching {
+		label, text = "search", string(m.query)
+	} else if m.waitFor == "port" {
 		label = "port"
 	}
 	return []segment{
 		{"  ", stylePlain},
 		{label + ": ", styleDim},
-		{string(m.typed), stylePlain},
+		{text, stylePlain},
 	}
+}
+
+// keyReader is where the menu decodes key presses from. It is buffered so that
+// an escape byte which turns out not to introduce a sequence can hand the byte
+// after it back to the next read.
+type keyReader interface {
+	io.Reader
+	UnreadByte() error
 }
 
 // readKey decodes one key press from raw terminal input. Arrow keys arrive as
 // an escape sequence, ESC [ A for up and ESC [ B for down, which is also how
 // many terminals spell the home-row variants.
-func readKey(r io.Reader) (key, error) {
+func readKey(r keyReader) (key, error) {
 	var b [1]byte
 	if _, err := io.ReadFull(r, b[:]); err != nil {
 		return key{}, err
@@ -394,9 +541,12 @@ func readKey(r io.Reader) (key, error) {
 		return key{kind: keyEnter}, nil
 	case 0x1b:
 		seq, err := readSeq(r)
-		if err != nil {
-			// A lone escape is not a key we act on, but running out of input
-			// while looking for the rest of a sequence is not a failure either.
+		switch {
+		case errors.Is(err, errNoSequence):
+			return key{kind: keyEscape}, nil
+		case err != nil:
+			// Running out of input in the middle of a sequence is not a failure,
+			// and the menu has no key to act on anyway.
 			return key{kind: keyRune}, nil
 		}
 		switch seq {
@@ -416,16 +566,23 @@ func readKey(r io.Reader) (key, error) {
 // readSeq collects the rest of a CSI or SS3 escape sequence. It stops at the
 // final byte, which for CSI is anything in 0x40 to 0x7e, so modified arrows
 // such as ESC [ 1 ; 2 A are read whole.
-func readSeq(r io.Reader) (string, error) {
+func readSeq(r keyReader) (string, error) {
 	var seq strings.Builder
 	var b [1]byte
 
+	// A lone escape, with nothing behind it, is the user pressing escape and
+	// not a sequence that got cut short.
 	if _, err := io.ReadFull(r, b[:]); err != nil {
-		return "", err
+		return "", errNoSequence
 	}
 	seq.WriteByte(b[0])
 	ss3 := b[0] == 'O'
 	if b[0] != '[' && !ss3 {
+		// Escape followed by an ordinary key, such as escape then enter, so the
+		// byte belongs to the next key press and has to go back.
+		if err := r.UnreadByte(); err == nil {
+			seq.Reset()
+		}
 		return "", errNoSequence
 	}
 
