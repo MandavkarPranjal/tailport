@@ -8,15 +8,15 @@ CGO_ENABLED = "0"
 
 [tasks.build]
 description = "Build the tailport binary"
-run = "go build -o tailport ./cmd/tailport"
+run = "go build -o tailport ."
 
 [tasks.install]
 description = "Install tailport into GOPATH/bin"
-run = "go install ./cmd/tailport"
+run = "go install ."
 
 [tasks.run]
 description = "Run tailport"
-run = "go run ./cmd/tailport"
+run = "go run ."
 
 [tasks.test]
 description = "Run the tests"

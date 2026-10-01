@@ -1,4 +1,4 @@
-// tailport shares a local port with your tailnet, and optionally the public
+// Command tailport shares a local port with your tailnet, and optionally the public
 // internet, using its own embedded Tailscale node named "tailport".
 //
 // Install it with:
@@ -12,4 +12,4 @@
 // Each machine keeps its own node credentials under its user config directory,
 // so the first run asks you to log in through a browser and later runs start
 // straight away. Set TS_AUTHKEY (or -authkey) to skip the browser entirely.
-package tailport
+package main
