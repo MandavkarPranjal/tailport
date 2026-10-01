@@ -1,0 +1,12 @@
+# Binaries
+/tailport
+/dist/
+
+# Local state and logs
+/tailport/
+*.log
+
+# Go coverage and profiling
+*.out
+*.test
+*.prof

@@ -1,0 +1,55 @@
+[tools]
+go = "1.27"
+golangci-lint = "latest"
+staticcheck = "latest"
+
+[env]
+CGO_ENABLED = "0"
+
+[tasks.build]
+description = "Build the tailport binary"
+run = "go build -o tailport ./cmd/tailport"
+
+[tasks.install]
+description = "Install tailport into GOPATH/bin"
+run = "go install ./cmd/tailport"
+
+[tasks.run]
+description = "Run tailport"
+run = "go run ./cmd/tailport"
+
+[tasks.test]
+description = "Run the tests"
+run = "go test ./..."
+
+[tasks.vet]
+description = "Run go vet"
+run = "go vet ./..."
+
+[tasks.fmt]
+description = "Format the code"
+run = "gofmt -w ."
+
+[tasks.fmtcheck]
+description = "Fail if anything is unformatted"
+run = "test -z \"$(gofmt -l .)\""
+
+[tasks.lint]
+description = "Run golangci-lint"
+run = "golangci-lint run"
+
+[tasks.staticcheck]
+description = "Run staticcheck"
+run = "staticcheck ./..."
+
+[tasks.ci]
+description = "Everything CI runs"
+depends = ["fmtcheck", "vet", "test", "lint", "staticcheck"]
+
+[tasks.tidy]
+description = "Tidy go.mod"
+run = "go mod tidy"
+
+[tasks.clean]
+description = "Remove build output"
+run = "rm -f tailport && go clean -testcache"
