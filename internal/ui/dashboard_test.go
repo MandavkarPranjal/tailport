@@ -945,8 +945,12 @@ func TestANoticeFromTheShareIsShownRatherThanCountedAsARequest(t *testing.T) {
 	if !strings.Contains(frame, "/a") || !strings.Contains(frame, "/b") {
 		t.Errorf("frame = %q, want both requests still on screen", frame)
 	}
-	if strings.Contains(frame, "42 requests were not recorded\n") {
-		t.Errorf("frame = %q, want the notice on the header rather than as a row", frame)
+	// Rows are written with an explicit carriage return, so look for a whole line
+	// rather than a trailing newline that no line here ever ends with.
+	for _, line := range strings.Split(frame, "\r\n") {
+		if line == "42 requests were not recorded" {
+			t.Errorf("frame = %q, want the notice on the header rather than as a row of its own", frame)
+		}
 	}
 }
 

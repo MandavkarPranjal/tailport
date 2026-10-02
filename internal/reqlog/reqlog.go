@@ -137,16 +137,31 @@ func OpenWriter(path string) (*Writer, error) {
 func (w *Writer) drain() {
 	defer close(w.drained)
 	for e := range w.queue {
-		if err := w.write(e); err != nil && w.writeErr == nil {
-			w.writeErr = err
-		}
-		w.noteDrops()
+		w.drainEvent(e)
 	}
 	// Drops can arrive with nothing left to write, so the log has to account for
 	// them as it closes too.
 	w.noteDrops()
 	if err := w.closeFile(); err != nil && w.writeErr == nil {
 		w.writeErr = err
+	}
+}
+
+// drainEvent writes one queued event and accounts for the burst around it.
+//
+// The gap is only mentioned once the writer has caught up. A queue that never
+// empties is a share serving faster than its disk can record, which is a
+// standing condition rather than a moment, and a notice per request would say
+// the same thing over and over while roughly doubling the log and filling a piped
+// watcher with near-identical lines. Close accounts for whatever is left, so a
+// burst is described once, at the end of it, and a gap that does end is marked
+// where the reader looking for the hole will find it.
+func (w *Writer) drainEvent(e Event) {
+	if err := w.write(e); err != nil && w.writeErr == nil {
+		w.writeErr = err
+	}
+	if len(w.queue) == 0 {
+		w.noteDrops()
 	}
 }
 

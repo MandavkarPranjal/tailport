@@ -81,18 +81,22 @@ func serveWith(ctx context.Context, env *ui.Env, opts shareOpts, pid int, logPat
 	// mid-read. The inner defer is registered last, so it runs first.
 	defer func() {
 		defer func() { _ = reqlog.Remove(stateDir, pid) }()
+		// Close shuts the queue, so nothing can be dropped after it returns and
+		// the count below is the run's final one rather than a snapshot that a
+		// handler still in flight could have gone past.
+		//
+		// Close is also where a write that could not land is finally reportable,
+		// and there is nowhere else for it to be said: nothing is watching the
+		// goroutines answering requests.
+		if err := requests.Close(); err != nil {
+			logs.Printf("request log: %v", err)
+		}
 		// The log drops requests rather than hold up the ones being served when
 		// it cannot keep up, so say so at the end instead of leaving a watcher
 		// looking at a record that quietly has holes in it. A watcher sees the
 		// same count for itself through the notice the writer puts in the log.
 		if missed := requests.Dropped(); missed > 0 {
 			logs.Printf("request log: %d not written, the share was serving faster than the disk could record", missed)
-		}
-		// Close is where a write that could not land is finally reportable, and
-		// there is nowhere else for it to be said: nothing is watching the
-		// goroutines answering requests.
-		if err := requests.Close(); err != nil {
-			logs.Printf("request log: %v", err)
 		}
 	}()
 
