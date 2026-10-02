@@ -67,11 +67,12 @@ func Mount(target Target, prefix string, logger *log.Logger) http.Handler {
 
 	// Register both /demo and /demo/ so the service answers with and without the
 	// trailing slash, and turn the bare prefix into a root path the service can
-	// still route.
+	// still route. Stripping has to happen before the rewrite, since StripPrefix
+	// answers 404 once the prefix is no longer on the path.
 	mounted := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == clean {
 			r = r.Clone(r.Context())
-			r.URL.Path = "/"
+			r.URL.Path = clean + "/"
 		}
 		http.StripPrefix(clean, inner).ServeHTTP(w, r)
 	})

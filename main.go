@@ -21,6 +21,11 @@ import (
 // version is stamped at build time with -ldflags "-X main.version=v1.2.3".
 var version = "0.1.0"
 
+// startNode brings up the node a serving command shares through. It is a
+// variable so tests can point `tailport up` and friends at a node.Node fake and
+// exercise the whole sharing path without a tailnet.
+var startNode node.Starter = node.Start
+
 func main() {
 	env := ui.NewEnv(os.Stdin, os.Stdout, os.Stderr)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -50,9 +55,9 @@ func run(ctx context.Context, args []string, env *ui.Env) error {
 	var err error
 	switch cmd {
 	case "up":
-		err = up(ctx, args, env)
+		err = up(ctx, args, env, startNode)
 	case daemon.ServeCommand:
-		err = serve(ctx, args, env)
+		err = serve(ctx, args, env, startNode)
 	case "status":
 		err = status(ctx, args, env)
 	case "stop":
@@ -60,7 +65,7 @@ func run(ctx context.Context, args []string, env *ui.Env) error {
 	case "list":
 		err = listPorts(env, args)
 	case "login":
-		err = login(ctx, args, env)
+		err = login(ctx, args, env, startNode)
 	case "version":
 		env.Line("tailport %s", version)
 	case "help", "-h", "--help":

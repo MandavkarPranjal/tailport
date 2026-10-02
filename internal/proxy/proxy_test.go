@@ -123,6 +123,35 @@ func TestMountStripsThePrefix(t *testing.T) {
 	}
 }
 
+func TestMountRoutesTheBarePrefixToTheServiceRoot(t *testing.T) {
+	var seen string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.URL.Path
+	}))
+	defer upstream.Close()
+
+	host, port := splitAddr(t, upstream.URL)
+	handler := Mount(Target{Host: host, Port: port}, "/demo", nil)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/demo", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bare prefix status = %d, want 200", rec.Code)
+	}
+	if seen != "/" {
+		t.Errorf("upstream saw path %q for the bare prefix, want /", seen)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/demo/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("prefix with slash status = %d, want 200", rec.Code)
+	}
+	if seen != "/" {
+		t.Errorf("upstream saw path %q for /demo/, want /", seen)
+	}
+}
+
 func TestMountTreatsAnEmptyPrefixAsEverything(t *testing.T) {
 	var seen string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

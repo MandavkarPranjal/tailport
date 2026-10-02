@@ -26,7 +26,7 @@ const tailnetPort = 80
 
 // serve is the hidden subcommand a detached tailport runs. It is also usable on
 // its own when someone wants to supervise the tunnel themselves.
-func serve(ctx context.Context, args []string, env *ui.Env) error {
+func serve(ctx context.Context, args []string, env *ui.Env, start node.Starter) error {
 	fs := newFlagSet("serve", env, usage)
 	var opts shareOpts
 	fs.IntVar(&opts.Port, "port", 0, "local port to share")
@@ -48,12 +48,12 @@ func serve(ctx context.Context, args []string, env *ui.Env) error {
 	if err := opts.validate(); err != nil {
 		return err
 	}
-	return serveWith(ctx, env, opts, os.Getpid(), opts.LogPath)
+	return serveWith(ctx, env, opts, os.Getpid(), opts.LogPath, start)
 }
 
 // serveWith starts the node, opens the listeners, records what it is sharing and
 // serves until ctx ends.
-func serveWith(ctx context.Context, env *ui.Env, opts shareOpts, pid int, logPath string) error {
+func serveWith(ctx context.Context, env *ui.Env, opts shareOpts, pid int, logPath string, start node.Starter) error {
 	stateDir := opts.StateDir
 	if stateDir == "" {
 		stateDir = node.StateDir()
@@ -69,7 +69,7 @@ func serveWith(ctx context.Context, env *ui.Env, opts shareOpts, pid int, logPat
 		logs = log.New(file, "", log.LstdFlags)
 	}
 
-	n, err := node.Start(ctx, opts.nodeConfig(func(format string, args ...any) {
+	n, err := start(ctx, opts.nodeConfig(func(format string, args ...any) {
 		logs.Printf(format, args...)
 	}), func(url string) {
 		env.Notice("log in to your tailnet to finish setting up %s", node.Name)
@@ -160,7 +160,7 @@ func serveWith(ctx context.Context, env *ui.Env, opts shareOpts, pid int, logPat
 
 // login brings the tailport node up and waits for it, so a first-time user can
 // do the browser step separately from sharing anything.
-func login(ctx context.Context, args []string, env *ui.Env) error {
+func login(ctx context.Context, args []string, env *ui.Env, start node.Starter) error {
 	fs := newFlagSet("login", env, usage)
 	var common commonFlags
 	addCommon(fs, &common)
@@ -169,7 +169,7 @@ func login(ctx context.Context, args []string, env *ui.Env) error {
 	}
 
 	env.Title("Logging the %s node in", node.Name)
-	n, err := node.Start(ctx, common.nodeConfig(func(format string, args ...any) {
+	n, err := start(ctx, common.nodeConfig(func(format string, args ...any) {
 		env.Detail(format, args...)
 	}), func(url string) {
 		env.Notice("Open this link to authorise %s:", node.Name)

@@ -96,18 +96,45 @@ type Config struct {
 	Logf func(format string, args ...any)
 }
 
-// Node is a running embedded Tailscale node.
-type Node struct {
+// Node is a running tailport node: somewhere a shared port is published, and the
+// addresses it is published at. Commands talk to this interface rather than to
+// tsnet directly, so the sharing path can be exercised without a tailnet.
+type Node interface {
+	// DNSName is the node's fully qualified name in the tailnet, for example
+	// tailport.tailc1e3a1.ts.net. It is empty when the tailnet has no MagicDNS.
+	DNSName() string
+	// Hostname is the node's short name, Name unless overridden.
+	Hostname() string
+	// IPs are the node's tailnet addresses.
+	IPs() []netip.Addr
+	// TailnetURL is the URL that works from inside the tailnet.
+	TailnetURL() string
+	// PublicURL is the public URL for a published port.
+	PublicURL(publicPort int) string
+	// ListenTailnet opens a listener reachable only from inside the tailnet.
+	ListenTailnet(port int) (net.Listener, error)
+	// ListenFunnel opens a listener published to the public internet.
+	ListenFunnel(publicPort int) (net.Listener, error)
+	// Close shuts the node down. It is safe to call more than once.
+	Close() error
+}
+
+// tsnetNode is the Node backed by a real embedded tsnet server.
+type tsnetNode struct {
 	srv      *tsnet.Server
 	hostname string
 	dnsName  string
 	closed   bool
 }
 
+// Starter brings a node up. Commands take one of these instead of calling Start
+// directly, so a test can substitute a Fake node for the embedded one.
+type Starter func(ctx context.Context, cfg Config, onAuthURL func(string)) (Node, error)
+
 // Start brings the embedded node up and waits until it is logged in and
 // running. When interactive login is needed, onAuthURL is called with the URL
 // to visit so the caller can show it to the user.
-func Start(ctx context.Context, cfg Config, onAuthURL func(string)) (*Node, error) {
+func Start(ctx context.Context, cfg Config, onAuthURL func(string)) (Node, error) {
 	hostname := cfg.Hostname
 	if hostname == "" {
 		hostname = Hostname()
@@ -154,7 +181,7 @@ func Start(ctx context.Context, cfg Config, onAuthURL func(string)) (*Node, erro
 		return nil, fmt.Errorf("start tailport node: %w", r.err)
 	}
 
-	return &Node{srv: srv, hostname: hostname, dnsName: dnsNameFrom(r.st)}, nil
+	return &tsnetNode{srv: srv, hostname: hostname, dnsName: dnsNameFrom(r.st)}, nil
 }
 
 // dnsNameFrom prefers the node's own MagicDNS name and falls back to the first
@@ -209,13 +236,13 @@ func watchAuthURL(ctx context.Context, srv *tsnet.Server, onAuthURL func(string)
 
 // DNSName is the node's fully qualified name in the tailnet, for example
 // tailport.tailc1e3a1.ts.net. It is empty when the tailnet has no MagicDNS.
-func (n *Node) DNSName() string { return n.dnsName }
+func (n *tsnetNode) DNSName() string { return n.dnsName }
 
 // Hostname is the node's short name, Name unless overridden.
-func (n *Node) Hostname() string { return n.hostname }
+func (n *tsnetNode) Hostname() string { return n.hostname }
 
 // IPs are the node's tailnet addresses.
-func (n *Node) IPs() []netip.Addr {
+func (n *tsnetNode) IPs() []netip.Addr {
 	ip4, ip6 := n.srv.TailscaleIPs()
 	var out []netip.Addr
 	for _, ip := range []netip.Addr{ip4, ip6} {
@@ -227,13 +254,13 @@ func (n *Node) IPs() []netip.Addr {
 }
 
 // TailnetURL is the URL that works from inside the tailnet, http://tailport.
-func (n *Node) TailnetURL() string {
+func (n *tsnetNode) TailnetURL() string {
 	return "http://" + n.hostname
 }
 
 // PublicURL is the Funnel URL for a published port. Funnel terminates TLS, so
 // every published port is https.
-func (n *Node) PublicURL(publicPort int) string {
+func (n *tsnetNode) PublicURL(publicPort int) string {
 	if publicPort == DefaultPublicPort || n.dnsName == "" {
 		return "https://" + n.dnsName
 	}
@@ -241,7 +268,7 @@ func (n *Node) PublicURL(publicPort int) string {
 }
 
 // ListenTailnet opens a listener reachable only from inside the tailnet.
-func (n *Node) ListenTailnet(port int) (net.Listener, error) {
+func (n *tsnetNode) ListenTailnet(port int) (net.Listener, error) {
 	if n.closed {
 		return nil, ErrClosed
 	}
@@ -257,7 +284,7 @@ func (n *Node) ListenTailnet(port int) (net.Listener, error) {
 
 // ListenFunnel opens a listener published to the public internet on
 // publicPort. Funnel only supports 443, 8443 and 10000.
-func (n *Node) ListenFunnel(publicPort int) (net.Listener, error) {
+func (n *tsnetNode) ListenFunnel(publicPort int) (net.Listener, error) {
 	if n.closed {
 		return nil, ErrClosed
 	}
@@ -272,7 +299,7 @@ func (n *Node) ListenFunnel(publicPort int) (net.Listener, error) {
 }
 
 // Close shuts the node down. It is safe to call more than once.
-func (n *Node) Close() error {
+func (n *tsnetNode) Close() error {
 	if n == nil || n.srv == nil || n.closed {
 		return nil
 	}

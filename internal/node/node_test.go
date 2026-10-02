@@ -100,7 +100,7 @@ func TestDNSNameFrom(t *testing.T) {
 }
 
 func TestNodeURLs(t *testing.T) {
-	n := &Node{hostname: Name, dnsName: "tailport.tailc1e3a1.ts.net"}
+	n := &tsnetNode{hostname: Name, dnsName: "tailport.tailc1e3a1.ts.net"}
 	if got, want := n.TailnetURL(), "http://tailport"; got != want {
 		t.Errorf("TailnetURL() = %q, want %q", got, want)
 	}
@@ -111,14 +111,14 @@ func TestNodeURLs(t *testing.T) {
 		t.Errorf("PublicURL(8443) = %q, want %q", got, want)
 	}
 
-	noDNS := &Node{hostname: Name}
+	noDNS := &tsnetNode{hostname: Name}
 	if got, want := noDNS.PublicURL(8443), "https://"; got != want {
 		t.Errorf("PublicURL without DNS = %q, want %q", got, want)
 	}
 }
 
 func TestClosedNodeRefusesListeners(t *testing.T) {
-	n := &Node{closed: true}
+	n := &tsnetNode{closed: true}
 	if _, err := n.ListenTailnet(80); !errors.Is(err, ErrClosed) {
 		t.Errorf("ListenTailnet on closed node = %v, want ErrClosed", err)
 	}
@@ -128,17 +128,17 @@ func TestClosedNodeRefusesListeners(t *testing.T) {
 }
 
 func TestCloseIsSafeOnNilAndTwice(t *testing.T) {
-	var n *Node
+	var n *tsnetNode
 	if err := n.Close(); err != nil {
 		t.Errorf("Close(nil) = %v, want nil", err)
 	}
-	if err := (&Node{}).Close(); err != nil {
+	if err := (&tsnetNode{}).Close(); err != nil {
 		t.Errorf("Close on zero node = %v, want nil", err)
 	}
 }
 
 func TestListenTailnetRejectsBadPort(t *testing.T) {
-	n := &Node{}
+	n := &tsnetNode{}
 	_, err := n.ListenTailnet(0)
 	if err == nil || !strings.Contains(err.Error(), "not a valid port") {
 		t.Fatalf("ListenTailnet(0) = %v, want an invalid port error", err)
@@ -146,7 +146,7 @@ func TestListenTailnetRejectsBadPort(t *testing.T) {
 }
 
 func TestListenFunnelRejectsUnpublishablePort(t *testing.T) {
-	n := &Node{}
+	n := &tsnetNode{}
 	_, err := n.ListenFunnel(3000)
 	if err == nil {
 		t.Fatal("ListenFunnel(3000) = nil error, want a rejection")

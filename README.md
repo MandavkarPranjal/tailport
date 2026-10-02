@@ -109,6 +109,10 @@ keeps the run records `status` and `stop` read; `internal/netports` finds the
 ports listening on the machine; `internal/daemon` handles backgrounding by
 re-executing the same binary.
 
+The commands depend on the `node.Node` interface rather than on tsnet, so tests
+substitute `node.NewFake` and drive the whole sharing path over loopback, with
+no tailnet and no login.
+
 ## Development
 
 ```sh

@@ -69,7 +69,7 @@ func (o shareOpts) daemonOptions() daemon.Options {
 }
 
 // up shares a port. With no flags it asks which one, which is the common case.
-func up(ctx context.Context, args []string, env *ui.Env) error {
+func up(ctx context.Context, args []string, env *ui.Env, start node.Starter) error {
 	fs := newFlagSet("up", env, usage)
 	var opts shareOpts
 	fs.IntVar(&opts.Port, "port", 0, "local port to share")
@@ -111,7 +111,7 @@ func up(ctx context.Context, args []string, env *ui.Env) error {
 	if *daemonise {
 		return startDaemon(ctx, env, opts)
 	}
-	return runShare(ctx, env, opts)
+	return runShare(ctx, env, opts, start)
 }
 
 // validate rejects flag combinations that cannot both be honoured.
@@ -162,8 +162,8 @@ func startDaemon(ctx context.Context, env *ui.Env, opts shareOpts) error {
 }
 
 // runShare serves in this process until ctx is cancelled or the user interrupts.
-func runShare(ctx context.Context, env *ui.Env, opts shareOpts) error {
-	return serveWith(ctx, env, opts, os.Getpid(), "")
+func runShare(ctx context.Context, env *ui.Env, opts shareOpts, start node.Starter) error {
+	return serveWith(ctx, env, opts, os.Getpid(), "", start)
 }
 
 // resolvePort returns the local port to share. With no port and no way to ask,
