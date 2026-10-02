@@ -19,7 +19,7 @@ import (
 )
 
 // version is stamped at build time with -ldflags "-X main.version=v1.2.3".
-var version = "0.1.0"
+var version = "0.2.0"
 
 // startNode brings up the node a serving command shares through. It is a
 // variable so tests can point `tailport up` and friends at a node.Node fake and
