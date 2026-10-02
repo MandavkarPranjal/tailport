@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,8 +38,10 @@ type Tail struct {
 	// poll is how long to wait between passes.
 	poll time.Duration
 	// dropped counts events discarded because the follower fell behind, so the
-	// view can say so instead of quietly lying about being complete.
-	dropped int
+	// view can say so instead of quietly lying about being complete. It is atomic
+	// because the follower is the only writer, but the dashboard asks for it on
+	// every frame while the follower is still running.
+	dropped atomic.Int64
 }
 
 // Options tunes a Tail.
@@ -50,10 +53,23 @@ type Options struct {
 	Poll time.Duration
 }
 
-// Start opens a log for following. A log that does not exist yet is not an
-// error: the run may not have served a first request, or may not have started,
-// and a follower has to keep waiting for the file to appear either way.
-func Start(path string, opts Options) *Tail {
+// Start opens a log for following, beginning at the given byte offset.
+//
+// The offset is an argument rather than an option because a caller that has just
+// read the log has to hand over where its reading stopped, and the one way to
+// get that wrong is not to say: a follower that starts at the end of the file
+// instead drops every request appended between the read and the start, since it
+// is past the end the follower assumes and behind the history already read, so
+// neither shows it. Passing ReadTail's offset keeps the two halves of a watch
+// joined up.
+//
+// A negative offset means start wherever the log ends right now, which is what
+// somebody who has not read the log wants.
+//
+// A log that does not exist yet is not an error: the run may not have served a
+// first request, or may not have started, and a follower has to keep waiting for
+// the file to appear either way.
+func Start(path string, offset int64, opts Options) *Tail {
 	t := &Tail{
 		events: make(chan Event, eventBuffer),
 		path:   path,
@@ -62,10 +78,19 @@ func Start(path string, opts Options) *Tail {
 	if t.poll <= 0 {
 		t.poll = pollInterval
 	}
-	if info, err := os.Stat(path); err == nil {
-		t.read = info.Size()
-		if opts.FromStart {
-			t.read = 0
+	switch {
+	case offset >= 0:
+		// A reader handed over where it got to, so begin there and trust it.
+		t.read = offset
+	case opts.FromStart:
+		t.read = 0
+	default:
+		// Nothing has been read, so start where the log ends. Falling back to
+		// zero when the file is not there yet means waiting for it shows its
+		// first request rather than nothing.
+		t.read = 0
+		if info, err := os.Stat(path); err == nil {
+			t.read = info.Size()
 		}
 	}
 	return t
@@ -100,9 +125,10 @@ func (t *Tail) Follow(ctx context.Context) {
 }
 
 // Dropped is how many events were discarded because the follower could not keep
-// up. It is read after Follow returns, so a caller that wants the number should
-// take it at the end.
-func (t *Tail) Dropped() int { return t.dropped }
+// up. It is safe to ask while Follow is running, which is how the dashboard
+// learns about it: the count is read on every frame so the view can admit what
+// it is not showing rather than quietly lying about being complete.
+func (t *Tail) Dropped() int { return int(t.dropped.Load()) }
 
 func (t *Tail) close() {
 	if t.file != nil {
@@ -183,6 +209,6 @@ func (t *Tail) publish(e Event) {
 	select {
 	case t.events <- e:
 	default:
-		t.dropped++
+		t.dropped.Add(1)
 	}
 }

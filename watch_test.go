@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -13,11 +14,12 @@ import (
 )
 
 // saveWatchRun records a run the way a sharing process would, so watch has
-// something to find. The pid is the test process, so the record looks alive.
-func saveWatchRun(t *testing.T, dir string, port int) state.Run {
+// something to find. The record is named after the pid, so two runs sharing one
+// pid would overwrite each other and watch would only ever see the last one.
+func saveWatchRun(t *testing.T, dir string, pid, port int) state.Run {
 	t.Helper()
 	run := state.Run{
-		PID:      os.Getpid(),
+		PID:      pid,
 		Port:     port,
 		Hostname: "tailport",
 		Mode:     state.ModeFunnel,
@@ -28,6 +30,28 @@ func saveWatchRun(t *testing.T, dir string, port int) state.Run {
 		t.Fatalf("Save() error: %v", err)
 	}
 	return run
+}
+
+// livePIDs hands out a different live pid on every call, so a test can save more
+// than one share in one state directory and watch really has to choose between
+// them. They have to be alive because watch reports a share that has exited.
+func livePIDs(t *testing.T) func() int {
+	t.Helper()
+	next := os.Getpid()
+	return func() int {
+		t.Helper()
+		// Pids are handed out in sequence, so the ones just above this process
+		// are the likeliest to already exist. A short walk is enough; anything
+		// longer means the machine is too odd to guess about.
+		for range 64 {
+			next++
+			if state.Alive(next) {
+				return next
+			}
+		}
+		t.Skip("cannot find another live pid on this machine")
+		return 0
+	}
 }
 
 // recordRequests leaves the request log a run would have written, so watch has
@@ -89,7 +113,7 @@ func TestWatchNamesAPortThatIsNotShared(t *testing.T) {
 
 func TestWatchShowsTheRequestsTheRunRecorded(t *testing.T) {
 	dir := t.TempDir()
-	share := saveWatchRun(t, dir, 3000)
+	share := saveWatchRun(t, dir, os.Getpid(), 3000)
 	recordRequests(t, dir, share,
 		reqlog.Event{Method: "GET", Path: "/index.html", Status: 200, Latency: 3 * time.Millisecond},
 		reqlog.Event{Method: "GET", Path: "/missing", Status: 404, Latency: time.Millisecond},
@@ -113,7 +137,7 @@ func TestWatchShowsTheRequestsTheRunRecorded(t *testing.T) {
 
 func TestWatchKeepsOnlyTheNewestRequestsItWasAskedFor(t *testing.T) {
 	dir := t.TempDir()
-	share := saveWatchRun(t, dir, 3000)
+	share := saveWatchRun(t, dir, os.Getpid(), 3000)
 	recordRequests(t, dir, share,
 		reqlog.Event{Method: "GET", Path: "/oldest", Status: 200},
 		reqlog.Event{Method: "GET", Path: "/middle", Status: 200},
@@ -136,7 +160,7 @@ func TestWatchKeepsOnlyTheNewestRequestsItWasAskedFor(t *testing.T) {
 
 func TestWatchShowsNoHistoryAtAllWhenAskedForNoLines(t *testing.T) {
 	dir := t.TempDir()
-	share := saveWatchRun(t, dir, 3000)
+	share := saveWatchRun(t, dir, os.Getpid(), 3000)
 	recordRequests(t, dir, share, reqlog.Event{Method: "GET", Path: "/already-served", Status: 200})
 
 	env, out, _ := newTestEnv(t)
@@ -176,17 +200,33 @@ func TestWatchSaysWhenTheShareHasAlreadyExited(t *testing.T) {
 
 func TestWatchPicksTheRunSharingThePortItWasGiven(t *testing.T) {
 	dir := t.TempDir()
-	saveWatchRun(t, dir, 3000)
-	wanted := saveWatchRun(t, dir, 4000)
-	recordRequests(t, dir, wanted, reqlog.Event{Method: "GET", Path: "/the-other-one", Status: 200})
+	pids := livePIDs(t)
+	other := saveWatchRun(t, dir, pids(), 3000)
+	wanted := saveWatchRun(t, dir, pids(), 4000)
+	recordRequests(t, dir, wanted, reqlog.Event{Method: "GET", Path: "/the-named-one", Status: 200})
+	recordRequests(t, dir, other, reqlog.Event{Method: "GET", Path: "/the-other-one", Status: 200})
+
+	// Two shares at once, so watch has to pick the right log rather than take
+	// whichever it happens to read first.
+	saved, err := state.List(dir)
+	if err != nil {
+		t.Fatalf("List() error: %v", err)
+	}
+	if len(saved) != 2 {
+		t.Fatalf("List() returned %d runs, want both shares on disk", len(saved))
+	}
 
 	env, out, _ := newTestEnv(t)
 	if err := run(stoppedContext(t), []string{"watch", "--state-dir", dir, "4000"}, env); err != nil {
 		t.Fatalf("run() error: %v", err)
 	}
 
-	if !contains(out.String(), "/the-other-one") {
-		t.Errorf("output = %q, want the requests of the named port", out.String())
+	text := out.String()
+	if !contains(text, "/the-named-one") {
+		t.Errorf("output = %q, want the requests of the named port", text)
+	}
+	if contains(text, "/the-other-one") {
+		t.Errorf("output = %q, want the other share left out", text)
 	}
 }
 
@@ -222,5 +262,70 @@ func TestWatchReportsAStateDirectoryItCannotRead(t *testing.T) {
 
 	if err := run(stoppedContext(t), []string{"watch", "--state-dir", file}, env); err == nil {
 		t.Error("run() error = nil, want the unreadable state directory reported")
+	}
+}
+
+func TestWatchShowsEveryRequestAShareServesWhileItIsWatching(t *testing.T) {
+	dir := t.TempDir()
+	share := saveWatchRun(t, dir, os.Getpid(), 3000)
+	recordRequests(t, dir, share, reqlog.Event{Method: "GET", Path: "/before-watch", Status: 200})
+
+	w, err := reqlog.OpenWriter(reqlog.Path(dir, share.PID))
+	if err != nil {
+		t.Fatalf("OpenWriter error: %v", err)
+	}
+
+	// A busy share is exactly when somebody watches, and it is serving the whole
+	// time watch is reading its history and starting to follow it. Every one of
+	// these has to be shown once: a request falling between the two halves of a
+	// watch would be shown by neither.
+	const served = 300
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range served {
+			if err := w.Append(reqlog.Event{
+				Method: "GET",
+				Path:   fmt.Sprintf("/served-%03d", i),
+				Status: 200,
+			}); err != nil {
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	env, out, _ := newTestEnv(t)
+	finished := make(chan error, 1)
+	go func() {
+		finished <- run(ctx, []string{"watch", "--state-dir", dir, "-n", "1000"}, env)
+	}()
+
+	// Wait for the last request to be shown, then stop.
+	last := fmt.Sprintf("/served-%03d", served-1)
+	deadline := time.After(10 * time.Second)
+	for !strings.Contains(out.String(), last) {
+		select {
+		case <-deadline:
+			t.Fatalf("watch never showed %s:\n%s", last, out.String())
+		case err := <-finished:
+			t.Fatalf("watch returned early: %v\n%s", err, out.String())
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	cancel()
+	<-done
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+	<-finished
+
+	text := out.String()
+	for i := range served {
+		path := fmt.Sprintf("/served-%03d", i)
+		if n := strings.Count(text, path); n != 1 {
+			t.Errorf("%s appeared %d times, want exactly once", path, n)
+		}
 	}
 }

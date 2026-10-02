@@ -82,6 +82,12 @@ func serveWith(ctx context.Context, env *ui.Env, opts shareOpts, pid int, logPat
 	defer func() {
 		defer func() { _ = reqlog.Remove(stateDir, pid) }()
 		_ = requests.Close()
+		// The log drops requests rather than hold up the ones being served when
+		// it cannot keep up, so say so at the end instead of leaving a watcher
+		// looking at a record that quietly has holes in it.
+		if missed := requests.Dropped(); missed > 0 {
+			logs.Printf("request log: %d not written, the share was serving faster than the disk could record", missed)
+		}
 	}()
 
 	n, err := start(ctx, opts.nodeConfig(func(format string, args ...any) {

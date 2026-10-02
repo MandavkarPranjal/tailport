@@ -144,7 +144,11 @@ func Prune(stateDir string) (int, error) {
 		}
 		return 0, fmt.Errorf("read state directory: %w", err)
 	}
-	removed := 0
+	// The request logs have to be dealt with first, while the records that say
+	// whether their runs are still alive are still on disk. The loop below
+	// deletes every record of a dead run, so anything decided afterwards would
+	// be looking for a file that is already gone.
+	removed := pruneRequestLogs(stateDir, entries)
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -161,7 +165,7 @@ func Prune(stateDir string) (int, error) {
 			removed++
 		}
 	}
-	return removed + pruneRequestLogs(stateDir, entries), nil
+	return removed, nil
 }
 
 // requestLogSuffix marks the request log that sits beside a run record. It
@@ -172,6 +176,10 @@ const requestLogSuffix = ".requests.jsonl"
 // pruneRequestLogs deletes the request logs of runs that have gone away. A run
 // removes its own log when it stops, so anything left here belongs to a run that
 // was killed, and the log would otherwise grow without bound on disk.
+//
+// It has to run before the records are pruned, because the record is what says
+// whether the log is still wanted. Called afterwards, every lookup fails on the
+// records already deleted above and the logs survive for ever.
 func pruneRequestLogs(stateDir string, entries []os.DirEntry) int {
 	removed := 0
 	for _, entry := range entries {
