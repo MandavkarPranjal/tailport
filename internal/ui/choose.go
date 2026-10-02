@@ -8,7 +8,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"golang.org/x/term"
 )
@@ -307,23 +306,17 @@ func (m *menu) accept() (value string, done bool, err error) {
 }
 
 // render draws one frame, overwriting the last one in place.
-//
-// Every line ends in an explicit carriage return because raw mode turns off the
-// terminal's newline translation, so a bare "\n" would only step down a row and
-// every line would land further right than the one before it. Rows are cut at
-// the terminal width so nothing wraps, which is what lets the next frame move
-// back up by an exact number of lines.
 func (m *menu) render() {
 	m.refreshSize()
 	if m.drawn > 0 {
 		fmt.Fprintf(m.env.Out, "\x1b[%dA\r\x1b[J", m.drawn)
 	}
 
-	var frame strings.Builder
+	f := newScreen(m.env, m.width)
 	pad := labelWidth(m.items)
 	start, rows := m.window()
-	m.writeLine(&frame, m.titleSegments(start, rows)...)
-	m.writeLine(&frame, segment{m.navLine(), styleDim})
+	f.write(m.titleSegments(start, rows)...)
+	f.write(segment{m.navLine(), styleDim})
 	for i := start; i < start+rows; i++ {
 		item := m.items[m.view[i]]
 		marker := segment{"  ", stylePlain}
@@ -341,19 +334,18 @@ func (m *menu) render() {
 		if item.Manual {
 			segs = append(segs, segment{"  (type a port)", styleDim})
 		}
-		m.writeLine(&frame, segs...)
+		f.write(segs...)
 	}
 	if len(m.view) == 0 {
-		m.writeLine(&frame, segment{fmt.Sprintf("  nothing matches %q", string(m.query)), styleYellow})
+		f.write(segment{fmt.Sprintf("  nothing matches %q", string(m.query)), styleYellow})
 	}
 	if m.hint != "" {
-		m.writeLine(&frame, segment{"  " + m.hint, styleYellow})
+		f.write(segment{"  " + m.hint, styleYellow})
 	}
-	m.writeLine(&frame, m.prompt()...)
+	f.write(m.prompt()...)
 
-	out := frame.String()
-	fmt.Fprint(m.env.Out, out)
-	m.drawn = strings.Count(out, "\n")
+	fmt.Fprint(m.env.Out, f.sb.String())
+	m.drawn = f.lines
 }
 
 // frameChrome is the number of lines the frame spends on the title, the key map,
@@ -420,87 +412,15 @@ func (m *menu) navLine() string {
 	return navHint
 }
 
-// style says how one piece of a frame line is painted.
-type style int
-
-const (
-	stylePlain style = iota
-	styleBold
-	styleDim
-	styleCyan
-	styleYellow
-)
-
-// segment is one piece of a frame line: the text as measured, and how to paint
-// it. Keeping the two apart is what lets a line be trimmed to the terminal
-// width before any escape sequence is written.
-type segment struct {
-	text  string
-	style style
-}
-
-// writeLine appends one frame line, trimmed so it cannot wrap.
-func (m *menu) writeLine(sb *strings.Builder, segs ...segment) {
-	limit := 0
-	if m.width > 2 {
-		limit = m.width - 1
-	}
-
-	used := 0
-	for _, s := range segs {
-		text := s.text
-		if limit > 0 && len(text) > limit-used {
-			text = cut(text, limit-used)
-		}
-		used += utf8.RuneCountInString(text)
-		sb.WriteString(paint(m.env, s.style, text))
-	}
-	sb.WriteString("\r\n")
-}
-
 // refreshSize re-reads the terminal size, so a resize mid-menu is picked up.
 func (m *menu) refreshSize() {
-	if m.fd < 0 {
-		return
+	width, height := size(m.fd)
+	if width > 0 {
+		m.width = width
 	}
-	if w, h, err := term.GetSize(m.fd); err == nil {
-		if w > 0 {
-			m.width = w
-		}
-		if h > 0 {
-			m.height = h
-		}
+	if height > 0 {
+		m.height = height
 	}
-}
-
-// paint wraps text in the escape codes for s.
-func paint(e *Env, s style, text string) string {
-	switch s {
-	case styleBold:
-		return e.Bold(text)
-	case styleDim:
-		return e.Dim(text)
-	case styleCyan:
-		return e.Cyan(text)
-	case styleYellow:
-		return e.Yellow(text)
-	}
-	return text
-}
-
-// cut shortens s to at most n runes without splitting one.
-func cut(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	count := 0
-	for i := range s {
-		if count == n {
-			return s[:i]
-		}
-		count++
-	}
-	return s
 }
 
 // prompt is the input line under the menu.

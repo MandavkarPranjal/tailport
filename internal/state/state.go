@@ -161,5 +161,37 @@ func Prune(stateDir string) (int, error) {
 			removed++
 		}
 	}
-	return removed, nil
+	return removed + pruneRequestLogs(stateDir, entries), nil
+}
+
+// requestLogSuffix marks the request log that sits beside a run record. It
+// deliberately does not end in .json, so state.List and Prune never mistake a
+// stream of requests for a run.
+const requestLogSuffix = ".requests.jsonl"
+
+// pruneRequestLogs deletes the request logs of runs that have gone away. A run
+// removes its own log when it stops, so anything left here belongs to a run that
+// was killed, and the log would otherwise grow without bound on disk.
+func pruneRequestLogs(stateDir string, entries []os.DirEntry) int {
+	removed := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), requestLogSuffix) {
+			continue
+		}
+		// <pid>.requests.jsonl belongs to <pid>.json, so the run record decides
+		// whether it is still wanted.
+		stem := strings.TrimSuffix(entry.Name(), requestLogSuffix)
+		data, err := os.ReadFile(filepath.Join(Dir(stateDir), stem+".json"))
+		if err != nil {
+			continue
+		}
+		run, err := decode(data)
+		if err != nil || Alive(run.PID) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(Dir(stateDir), entry.Name())); err == nil {
+			removed++
+		}
+	}
+	return removed
 }

@@ -46,6 +46,8 @@ tailport up -p 3000 --all         # publish on 443, 8443 and 10000
 tailport up -p 3000 --path /demo  # publish under a URL prefix
 tailport up -p 3000 -d            # keep running in the background
 tailport status                   # what is shared, and since when
+tailport watch                    # live request log for a share
+tailport watch 3000               # live request log for port 3000
 tailport stop                     # stop everything
 tailport stop 3000                # stop one port
 tailport list                     # ports on this machine that can be shared
@@ -60,6 +62,21 @@ arrow keys move between the matches and `esc` clears the filter.
 Sharing runs in the foreground and stops with Ctrl-C. With `-d` tailport
 re-executes itself in the background, records itself so `status` and `stop` can
 find it, and writes to a log under its state directory.
+
+## Watch
+
+`tailport watch` shows the requests a share is serving as they arrive: time,
+method, path, status and latency, with a bar per request scaled against the
+slowest one in view so the shape of the traffic is readable at a glance. `c`
+clears the view, `q` and Ctrl-C stop watching.
+
+Every run writes its requests to a file under its state directory, so watch
+works against a background `-d` share and one running in another terminal
+alike. Piped somewhere, it drops the dashboard and prints one plain line per
+request, which is what you want for `tailport watch | grep 502`.
+
+`-n`, `--lines` sets how many past requests to show before the live feed, 20 by
+default; `-n 0` shows only what arrives from now on.
 
 Funnel can only publish ports 443, 8443 and 10000, since those are where it
 terminates TLS. `--public-port` picks a different one of those; `--all` takes all
