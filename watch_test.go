@@ -6,12 +6,35 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/MandavkarPranjal/tailport/internal/reqlog"
 	"github.com/MandavkarPranjal/tailport/internal/state"
+	"github.com/MandavkarPranjal/tailport/internal/ui"
 )
+
+// syncBuffer is a bytes.Buffer that survives being written by one goroutine and
+// read by another. A test that watches a live command while polling its output
+// would otherwise race, and fail under -race rather than on a real bug.
+type syncBuffer struct {
+	mu sync.Mutex
+	sb strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sb.Write(p)
+}
+
+// String takes what has been written so far.
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sb.String()
+}
 
 // saveWatchRun records a run the way a sharing process would, so watch has
 // something to find. The record is named after the pid, so two runs sharing one
@@ -295,7 +318,10 @@ func TestWatchShowsEveryRequestAShareServesWhileItIsWatching(t *testing.T) {
 	}()
 
 	ctx, cancel := context.WithCancel(t.Context())
-	env, out, _ := newTestEnv(t)
+	// Watch runs on its own goroutine while this test reads what it has printed,
+	// so the two need a buffer that tolerates being read mid write.
+	out := &syncBuffer{}
+	env := ui.NewEnv(strings.NewReader(""), out, out)
 	finished := make(chan error, 1)
 	go func() {
 		finished <- run(ctx, []string{"watch", "--state-dir", dir, "-n", "1000"}, env)

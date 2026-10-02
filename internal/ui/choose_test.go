@@ -612,10 +612,15 @@ func TestCellsCountsTerminalCellsRatherThanRunes(t *testing.T) {
 		// counting runes here would let a row overrun the terminal and wrap.
 		{name: "a wide character takes two cells", in: "日本語", want: 6},
 		{name: "wide and narrow mix", in: "a日b", want: 4},
-		// A combining accent is drawn on top of the character before it and
-		// costs nothing, so counting it would push the row out early.
-		{name: "a combining accent takes no cell of its own", in: "é", want: 1},
-		{name: "combining marks after a base cost nothing", in: "éx", want: 2},
+		// A precomposed character carries its accent inside its own code point,
+		// so it is ordinary one-cell text and says nothing about marks. A
+		// combining mark is a code point of its own that rides on the character
+		// before it and costs nothing, so counting it would push the row out
+		// early. Only the decomposed spelling actually gets at that.
+		{name: "precomposed accented latin is one cell", in: "\u00e9", want: 1},
+		{name: "a decomposed accent takes no cell of its own", in: "e\u0301", want: 1},
+		{name: "a decomposed accent before a base character costs nothing", in: "e\u0301x", want: 2},
+		{name: "two combining marks still cost nothing", in: "e\u0327\u0301", want: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -657,6 +662,11 @@ func TestScreenDoesNotWrapALineFullOfWideCharacters(t *testing.T) {
 	s.write(segment{"日本語です", stylePlain})
 
 	line := strings.TrimSuffix(s.sb.String(), "\r\n")
+	// The width is the half of the test: clipping is only worth anything if the
+	// characters that do fit are kept. Dropping the lot would satisfy a bound.
+	if line != "日本語" {
+		t.Errorf("line = %q, want the three characters that fit", line)
+	}
 	if got := cells(line); got > 6 {
 		t.Errorf("line = %q takes %d cells, want at most 6 so it cannot wrap", line, got)
 	}

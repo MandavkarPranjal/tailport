@@ -42,6 +42,11 @@ type Event struct {
 	// Error is the upstream failure, when the local service could not be
 	// reached at all. It is empty for a request that got any answer.
 	Error string `json:"error,omitempty"`
+	// Notice is a message from the run about its own log rather than a request
+	// it served, such as how many requests it had to drop. Only one record at a
+	// time carries one, and a watcher shows it apart from the requests so it is
+	// never mistaken for one or counted as one.
+	Notice string `json:"notice,omitempty"`
 }
 
 // FileName is the request log of one run, keyed by pid like a state record. The
@@ -79,12 +84,17 @@ type Writer struct {
 	// goroutine taking from it has finished.
 	queue   chan Event
 	drained chan struct{}
-	// closeErr is the result of closing the file, written before drained is
-	// closed so that Close can read it safely.
-	closeErr error
+	// writeErr is the first thing that went wrong while recording the log:
+	// either a queued write that could not land, or the close that failed if
+	// nothing went wrong before it. It is written before drained is closed, so
+	// Close can read it safely once the drain has finished.
+	writeErr error
 	// dropped counts the events Observe had to throw away because the queue was
 	// full.
 	dropped atomic.Int64
+	// reported is how many of those drops the log has already told its readers
+	// about. Only the drain goroutine touches it.
+	reported int64
 }
 
 // queueDepth is how many events may be waiting to be written before the log
@@ -118,12 +128,26 @@ func OpenWriter(path string) (*Writer, error) {
 
 // drain writes queued events one at a time, and then closes the file. Doing both
 // here is what lets Close be one step: shut the queue and wait for it.
+//
+// A failed write is kept rather than thrown away. It cannot be reported to
+// anybody at the time it happens, since nothing is watching the goroutine that
+// is serving requests, but Close is waiting for this goroutine and can hand it
+// on. Only the first failure is kept, because that is the one that explains the
+// rest: once a disk is full every write after it fails for the same reason.
 func (w *Writer) drain() {
 	defer close(w.drained)
 	for e := range w.queue {
-		_ = w.write(e)
+		if err := w.write(e); err != nil && w.writeErr == nil {
+			w.writeErr = err
+		}
+		w.noteDrops()
 	}
-	w.closeErr = w.closeFile()
+	// Drops can arrive with nothing left to write, so the log has to account for
+	// them as it closes too.
+	w.noteDrops()
+	if err := w.closeFile(); err != nil && w.writeErr == nil {
+		w.writeErr = err
+	}
 }
 
 // write puts one event on disk in a single write, so a follower sees it as soon
@@ -191,6 +215,34 @@ func (w *Writer) Dropped() int {
 	return int(w.dropped.Load())
 }
 
+// noteDrops writes a notice into the log when events have been dropped since the
+// last notice, so somebody watching learns about the gap from the log they are
+// already reading rather than only from the share's own output, which they may
+// not be able to see at all.
+//
+// The notice carries the running total rather than the latest batch, because a
+// gap in a log is read as "everything up to here is all of it". It is written
+// from the drain goroutine, which is the only writer, so a busy share pays for it
+// with a counter read and at most one extra line rather than with anything on the
+// goroutines answering requests.
+func (w *Writer) noteDrops() {
+	dropped := w.dropped.Load()
+	if dropped == w.reported {
+		return
+	}
+	w.reported = dropped
+
+	what := "requests were not recorded"
+	if dropped == 1 {
+		what = "request was not recorded"
+	}
+	// The notice is itself a record in the log, so it can fail to be written.
+	// There is nothing to be done about that here: the count is already in
+	// Dropped, and a run that cannot write this line cannot write the next one
+	// either.
+	_ = w.write(Event{Notice: fmt.Sprintf("%d %s", dropped, what)})
+}
+
 // closeFile closes the file once, and reports what happened if it had to.
 func (w *Writer) closeFile() error {
 	w.mu.Lock()
@@ -208,6 +260,10 @@ func (w *Writer) closeFile() error {
 // Close stops accepting events, waits for the ones already queued to be written,
 // and then closes the file. Calling it twice is safe, so a deferred Close next to
 // an explicit one does not panic.
+//
+// It reports the first thing that went wrong along the way, so a share can say
+// out loud that its log was short rather than leaving a watcher to assume it saw
+// everything.
 func (w *Writer) Close() error {
 	w.mu.Lock()
 	if w.stopped {
@@ -221,7 +277,7 @@ func (w *Writer) Close() error {
 	// Waiting for the drain to finish is what keeps the log honest: a share that
 	// shuts down must not lose the requests it served on its way out.
 	<-w.drained
-	return w.closeErr
+	return w.writeErr
 }
 
 // errClosed marks an append to a log that has already been closed, which
@@ -245,12 +301,13 @@ func Remove(stateDir string, pid int) error {
 // maxLine is the longest request log line ReadTail will consider.
 //
 // A request path is not short by construction: net/http accepts a request line
-// up to DefaultMaxHeaderBytes, and every byte of one can come back out of JSON
-// as a six byte escape such as "	". A valid request therefore writes a
-// line up to roughly six times the header limit, so a token limit below that
-// would fail the read on a request tailport really did serve and abort a watch
-// that was working. Rounding up leaves room for the other fields and for the
-// growth those bounds leave behind.
+// up to DefaultMaxHeaderBytes, and encoding/json can turn any one byte of it
+// into a six character escape on the way out. A control byte becomes \uXXXX, and
+// <, > and & are escaped as well, so a log stays safe to embed in a page.
+// A valid request therefore writes a line up to roughly six times the header
+// limit, so a token limit below that would fail the read on a request tailport
+// really did serve and abort a watch that was working. Rounding up leaves room
+// for the other fields and for the growth those bounds leave behind.
 //
 // A line past this is treated as unreadable rather than fatal, the same as a
 // line that will not parse, so one corrupt record cannot end a watch.
@@ -266,7 +323,7 @@ const maxLine = 8 * http.DefaultMaxHeaderBytes
 // just read a log should start the tail at this offset rather than at the end of
 // the file: a request appended between the two would be past the end the tail
 // assumes and behind the read the tail is meant to continue, so it would appear
-// in neither. Pass the offset to Options.Offset.
+// in neither. Pass the offset to Start as where to begin following.
 //
 // Only the tail is kept, because a log belongs to a run that may have been
 // serving for hours: a share left up over a busy afternoon records far more
