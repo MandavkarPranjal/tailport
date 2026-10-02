@@ -140,8 +140,10 @@ func (w *Writer) drain() {
 		w.drainEvent(e)
 	}
 	// Drops can arrive with nothing left to write, so the log has to account for
-	// them as it closes too.
-	w.noteDrops()
+	// them as it closes too. The queue is shut by then, so the second half of
+	// caughtUp is only there to say how many there are.
+	_, dropped := w.caughtUp()
+	w.noteDrops(dropped)
 	if err := w.closeFile(); err != nil && w.writeErr == nil {
 		w.writeErr = err
 	}
@@ -160,9 +162,24 @@ func (w *Writer) drainEvent(e Event) {
 	if err := w.write(e); err != nil && w.writeErr == nil {
 		w.writeErr = err
 	}
-	if len(w.queue) == 0 {
-		w.noteDrops()
+	if caughtUp, dropped := w.caughtUp(); caughtUp {
+		w.noteDrops(dropped)
 	}
+}
+
+// caughtUp asks, as one locked answer, whether the writer has caught up with the
+// events still queued and how many have been dropped so far.
+//
+// Both halves have to come from the same lock as Observe, which is what changes
+// them together. Read separately, the queue can look empty while a handler is in
+// the middle of accepting a request, and the count read afterwards would then
+// include drops that happened after that request was accepted: the notice would
+// go in ahead of a request that survived the gap it describes, and a reader
+// looking for the hole would have no way to tell where the hole really starts.
+func (w *Writer) caughtUp() (bool, int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.queue) == 0, w.dropped.Load()
 }
 
 // write puts one event on disk in a single write, so a follower sees it as soon
@@ -240,8 +257,7 @@ func (w *Writer) Dropped() int {
 // from the drain goroutine, which is the only writer, so a busy share pays for it
 // with a counter read and at most one extra line rather than with anything on the
 // goroutines answering requests.
-func (w *Writer) noteDrops() {
-	dropped := w.dropped.Load()
+func (w *Writer) noteDrops(dropped int64) {
 	if dropped == w.reported {
 		return
 	}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -624,8 +625,8 @@ func TestDropsAreAnnouncedOnceAndThenAgainOnlyWhenThereAreMore(t *testing.T) {
 
 	w.Observe(Event{Method: "GET", Status: 200})
 	w.Observe(Event{Method: "GET", Status: 200}) // dropped
-	w.noteDrops()
-	w.noteDrops() // nothing new to say
+	w.noteDrops(w.dropped.Load())
+	w.noteDrops(w.dropped.Load()) // nothing new to say
 
 	drainQuietly(t, w)
 
@@ -673,10 +674,10 @@ func TestDropsAreCountedRunningRatherThanPerBatch(t *testing.T) {
 	for range 2 {
 		w.Observe(Event{Method: "GET", Status: 200}) // dropped
 	}
-	w.noteDrops()
+	w.noteDrops(w.dropped.Load())
 	w.Observe(Event{Method: "GET", Status: 200})
 	w.Observe(Event{Method: "GET", Status: 200}) // dropped
-	w.noteDrops()
+	w.noteDrops(w.dropped.Load())
 
 	drainQuietly(t, w)
 
@@ -774,5 +775,91 @@ func TestAGapThatEndsIsAnnouncedWhereTheWriterCaughtUp(t *testing.T) {
 	}
 	if last := events[len(events)-1]; last.Notice == "" {
 		t.Errorf("the last record is %+v, want the notice after the gap it marks", last)
+	}
+}
+
+// seqIn reads the request number back out of a path the producer above wrote.
+func seqIn(path string) int {
+	n, err := strconv.Atoi(strings.TrimPrefix(path, "/r"))
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// TestANoticeNeverLandsAheadOfARequestThatWasAcceptedBeforeTheDrops pins where a
+// notice may sit in the log rather than what it says.
+//
+// Worth being honest about what this does and does not do. The ordering it
+// guards could not be made to happen by any schedule tried here, including
+// several thousand contended bursts, because reaching it needs an accepted
+// request and a dropped one to land inside the handful of nanoseconds between
+// the writer's two reads of shared state, and one Observe call is already longer
+// than that. An earlier version of this test did fail against the unfixed
+// writer, but every failure was the harmless case: a running total written
+// beside a request that was accepted after the drop it counts, which is true and
+// says nothing. So this test passes against the old ordering too. It is here to
+// state the invariant rather than to prove a bug that is hard to reach.
+//
+// One producer submits requests in order, so which ones were dropped and which
+// survived is known exactly: only Observe grows the drop count and only this
+// goroutine calls Observe, so reading Dropped either side of one call says
+// whether that request was accepted without racing anything. Each burst is a
+// pair, one that fits in the queue and one that does not, and a pause before it
+// lets the writer catch up, which is the moment a notice is written at all.
+func TestANoticeNeverLandsAheadOfARequestThatWasAcceptedBeforeTheDrops(t *testing.T) {
+	w, path := quietWriter(t, 1)
+	go w.drain()
+
+	// A queue of one and a tight loop, which is the shape most likely to have the
+	// writer repeatedly seen caught up while requests are still going wrong.
+	const pairs = 6000
+	var dropped []int
+	seq := 0
+	for range pairs {
+		for range 2 {
+			before := w.Dropped()
+			w.Observe(Event{Method: "GET", Path: fmt.Sprintf("/r%05d", seq)})
+			if w.Dropped() != before {
+				dropped = append(dropped, seq)
+			}
+			seq++
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+	if len(dropped) == 0 {
+		t.Skip("the writer kept up with every request, so there was no gap to describe")
+	}
+
+	// A notice marks where the writer caught up, and the count it carries is the
+	// running total. So every request accepted before the drop that total was
+	// taken at has to be written before the notice; requests accepted after that
+	// drop may sit on either side, since the notice says nothing about them.
+	//
+	// The queue is first in first out, so requests appear in the order they were
+	// accepted. A notice is therefore owed satisfaction by the first request after
+	// it that was numbered at or above the drop it describes.
+	var owed []int
+	for _, ev := range logAt(t, path) {
+		if ev.Notice != "" {
+			count, _, _ := strings.Cut(ev.Notice, " ")
+			total, err := strconv.Atoi(count)
+			if err != nil || total < 1 || total > len(dropped) {
+				t.Fatalf("notice %q names a count this test cannot account for, out of %d drops", ev.Notice, len(dropped))
+			}
+			owed = append(owed, dropped[total-1])
+			continue
+		}
+		seq := seqIn(ev.Path)
+		for i := 0; i < len(owed); {
+			if seq >= owed[i] {
+				owed = append(owed[:i], owed[i+1:]...)
+				continue
+			}
+			t.Errorf("request %d was accepted before the drop that the notice above describes, but is written after it: the gap is marked ahead of a request that survived it", seq)
+			i++
+		}
 	}
 }
