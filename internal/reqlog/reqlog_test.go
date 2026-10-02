@@ -601,8 +601,8 @@ func TestDropsAreWrittenIntoTheLogSoAWatcherCanSeeThem(t *testing.T) {
 	if got := len(noticesIn(events)); got != 1 {
 		t.Fatalf("the log holds %d notices, want 1", got)
 	}
-	// The notice lands where the drain first noticed the gap rather than at the
-	// end, so it is found by looking for it. That is the point of it: the gap is
+	// The notice lands where the writer caught up rather than at the end of the
+	// log, so it is found by looking for it. That is the point of it: the gap is
 	// marked where it is, not described later.
 	var notice Event
 	for _, ev := range events {
@@ -707,5 +707,72 @@ func TestANoticeNeverCountsAsARequestInTheDashboard(t *testing.T) {
 				t.Errorf("the notice carries request fields: %+v", ev)
 			}
 		}
+	}
+}
+
+func TestASustainedOverloadCostsOneNoticeRatherThanOnePerRequest(t *testing.T) {
+	const served = 25
+	// A queue deep enough to hold the whole burst, so nothing is lost while it is
+	// being set up. The drops happen later, while the writer is working through
+	// it, which is the shape of a share serving faster than its disk can record.
+	w, path := quietWriter(t, served)
+	for range served {
+		w.Observe(Event{Method: "GET", Path: "/queued", Status: 200})
+	}
+
+	// Work through the queue by hand, always refilling it so it never empties:
+	// every write lands on a gap that grew since the last one, and none of them
+	// is the end of the burst.
+	for i := range served {
+		w.drainEvent(<-w.queue)
+		w.Observe(Event{Method: "GET", Path: fmt.Sprintf("/%d", i), Status: 200})
+		w.Observe(Event{Method: "GET", Path: "/lost", Status: 200}) // dropped
+	}
+	// Hand the rest to the real drain, which is what Close is waiting for.
+	go w.drain()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+	if got := w.Dropped(); got != served {
+		t.Fatalf("Dropped() = %d, want %d", got, served)
+	}
+
+	events := logAt(t, path)
+
+	// One line per served request would roughly double the log and fill a piped
+	// watcher with near-identical notices, all saying the same standing
+	// condition. Close accounts for the burst once, which is what answers "how
+	// much is missing".
+	if got := noticesIn(events); len(got) != 1 {
+		t.Fatalf("the log holds %d notices %q, want 1 for a burst that never let the writer catch up", len(got), got)
+	}
+	if want := "25 requests were not recorded"; noticesIn(events)[0] != want {
+		t.Errorf("Notice = %q, want %q", noticesIn(events)[0], want)
+	}
+	if got, want := len(events), 2*served+1; got != want {
+		t.Errorf("the log holds %d records, want %d requests and one notice", got, want)
+	}
+}
+
+func TestAGapThatEndsIsAnnouncedWhereTheWriterCaughtUp(t *testing.T) {
+	// Two fit, two are lost, and then the writer catches up: the notice belongs
+	// after the last request that made it in, which is where the reader looking
+	// for the hole will find it.
+	w, path := quietWriter(t, 2)
+	for i := range 4 {
+		w.Observe(Event{Method: "GET", Path: fmt.Sprintf("/%d", i), Status: 200})
+	}
+
+	drainQuietly(t, w)
+
+	events := logAt(t, path)
+	if got := len(noticesIn(events)); got != 1 {
+		t.Fatalf("the log holds %d notices, want 1", got)
+	}
+	if want := "2 requests were not recorded"; noticesIn(events)[0] != want {
+		t.Errorf("Notice = %q, want %q", noticesIn(events)[0], want)
+	}
+	if last := events[len(events)-1]; last.Notice == "" {
+		t.Errorf("the last record is %+v, want the notice after the gap it marks", last)
 	}
 }
