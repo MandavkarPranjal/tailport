@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/MandavkarPranjal/tailport/internal/reqlog"
@@ -145,12 +147,19 @@ func (d *dashboard) readKeys(ctx context.Context, out chan<- key) {
 }
 
 // key handles one key press and reports whether the dashboard should close.
+//
+// Both q and ctrl-c have to quit, not just ctrl-c. The footer names them both,
+// and a hint that does not work is worse than no hint: somebody reads it, presses
+// q, watches the log keep scrolling, and concludes the dashboard is stuck.
 func (d *dashboard) key(k key) bool {
 	switch k.kind {
 	case keyQuit:
 		return true
 	case keyRune:
-		if k.r == 'c' || k.r == 'C' {
+		switch k.r {
+		case 'q', 'Q':
+			return true
+		case 'c', 'C':
 			d.clear()
 		}
 	}
@@ -235,9 +244,15 @@ func (d *dashboard) render() {
 	shown := d.events[len(d.events)-rows:]
 	s := newScreen(d.env, d.width)
 	s.write(d.header()...)
+	// Every bar is measured against the slowest request on screen, so the widest
+	// bar on a frame always belongs to a request the viewer can see. Scaling
+	// against a request that has scrolled off would make a screen full of fast
+	// requests look uniformly terrible with no way to tell why. The header keeps
+	// reporting the slowest overall, which is a different and equally true number.
 	layout := layoutRow(d.width, longestPath(shown))
+	peak := slowest(shown)
 	for _, ev := range shown {
-		s.write(requestRow(ev, layout, slowest(d.events))...)
+		s.write(requestRow(ev, layout, peak)...)
 	}
 	if len(d.events) == 0 {
 		s.write(segment{"  waiting for requests...", styleDim})
@@ -341,7 +356,7 @@ func requestRow(ev reqlog.Event, layout rowLayout, peak time.Duration) []segment
 		{"  ", stylePlain},
 		{ev.Time.Format("15:04:05"), styleDim},
 		{" ", stylePlain},
-		{padRight(ev.Method, rowMethodWidth), stylePlain},
+		{padRight(printable(ev.Method), rowMethodWidth), stylePlain},
 		{" ", stylePlain},
 		{trimPath(pathOf(ev), layout.path), stylePlain},
 		{" ", stylePlain},
@@ -356,7 +371,7 @@ func requestRow(ev reqlog.Event, layout rowLayout, peak time.Duration) []segment
 		// Only worth a column when there is no bar to explain it. In the
 		// dashboard the bar and the red status are the signal on their own, and
 		// the reason a request failed lives in the share's own log.
-		segs = append(segs, segment{"  " + ev.Error, styleDim})
+		segs = append(segs, segment{"  " + printable(ev.Error), styleDim})
 	}
 	return segs
 }
@@ -395,9 +410,19 @@ func (e *Env) streamRequests(ctx context.Context, history []reqlog.Event, events
 // barCells is a latency as a run of blocks against the slowest latency in view.
 // It never shrinks below one cell, because a request that was instant still
 // happened and still deserves a tick on the chart.
+//
+// The two degenerate cases answer different questions, so they are handled
+// apart rather than together. No room at all means no bar, which is what a pipe
+// or a narrow terminal asks for. No measurable latency means the request was
+// instant, and an instant request gets the smallest bar there is: giving it the
+// whole width would paint it as the slowest thing on screen, which is the one
+// thing a chart measuring latency must never say.
 func barCells(latency, peak time.Duration, width int) int {
-	if width <= 0 || latency <= 0 {
-		return width
+	if width <= 0 {
+		return 0
+	}
+	if latency <= 0 {
+		return min(1, width)
 	}
 	n := width
 	if peak > latency {
@@ -475,7 +500,7 @@ func failures(events []reqlog.Event) int {
 func longestPath(events []reqlog.Event) int {
 	longest := 0
 	for _, ev := range events {
-		if n := utf8.RuneCountInString(pathOf(ev)); n > longest {
+		if n := cells(pathOf(ev)); n > longest {
 			longest = n
 		}
 	}
@@ -483,12 +508,49 @@ func longestPath(events []reqlog.Event) int {
 }
 
 // pathOf is the path the client asked for, which is never empty but is quoted
-// empty when a record somehow lost it.
+// empty when a record somehow lost it. It is made printable before anything else
+// sees it, because it is the one field a stranger gets to write.
 func pathOf(ev reqlog.Event) string {
 	if ev.Path == "" {
 		return "/"
 	}
-	return ev.Path
+	return printable(ev.Path)
+}
+
+// printable makes a field safe to put in a terminal.
+//
+// A path is whatever the client typed, and net/http decodes percent escapes in
+// the request target, so %1b and %0A arrive here as real characters: a request
+// for "/%1b[2J" would clear the screen of whoever is watching, and a newline in
+// a path would turn one served request into two lines of a piped log. The method
+// and the error text are escaped for the same reason, on the assumption that a
+// record can come from anywhere. Control characters are shown as the escapes they
+// already look like everywhere else in Go, which keeps the request readable
+// without obeying it.
+func printable(s string) string {
+	if !strings.ContainsFunc(s, isControlRune) {
+		return s
+	}
+	var sb strings.Builder
+	sb.Grow(len(s) + 8)
+	for _, r := range s {
+		if isControlRune(r) {
+			// QuoteRuneToASCII always wraps in single quotes, so dropping them
+			// leaves the escape on its own.
+			quoted := strconv.QuoteRuneToASCII(r)
+			sb.WriteString(quoted[1 : len(quoted)-1])
+			continue
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
+}
+
+// isControlRune reports whether r moves the cursor or repaints the screen. It
+// covers C1 as well as C0, since a terminal in UTF-8 mode reads a raw 0x9b as the
+// start of a sequence just as it reads an escape byte.
+func isControlRune(r rune) bool {
+	return unicode.IsControl(r)
 }
 
 // trimPath shortens p to at most n cells, keeping the end: a path that is too
@@ -498,19 +560,31 @@ func trimPath(p string, n int) string {
 	if n <= 0 {
 		return p
 	}
-	r := []rune(p)
-	if len(r) <= n {
+	if cells(p) <= n {
 		return p
 	}
 	if n == 1 {
 		return "…"
 	}
-	return "…" + string(r[len(r)-(n-1):])
+	// The ellipsis spends one of the cells, so the tail has to be found by
+	// measuring backwards rather than by counting runes off the end.
+	budget := n - 1
+	at := len(p)
+	for at > 0 {
+		r, size := utf8.DecodeLastRuneInString(p[:at])
+		w := cellWidth(r)
+		if w > budget {
+			break
+		}
+		budget -= w
+		at -= size
+	}
+	return "…" + p[at:]
 }
 
 // padLeft right aligns s in a column of n cells.
 func padLeft(s string, n int) string {
-	if d := n - utf8.RuneCountInString(s); d > 0 {
+	if d := n - cells(s); d > 0 {
 		return strings.Repeat(" ", d) + s
 	}
 	return s
@@ -518,7 +592,7 @@ func padLeft(s string, n int) string {
 
 // padRight left aligns s in a column of n cells.
 func padRight(s string, n int) string {
-	if d := n - utf8.RuneCountInString(s); d > 0 {
+	if d := n - cells(s); d > 0 {
 		return s + strings.Repeat(" ", d)
 	}
 	return s

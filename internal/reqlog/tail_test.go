@@ -20,7 +20,7 @@ func TestTailPublishesWhatIsAppendedAfterItStarts(t *testing.T) {
 	}
 	defer w.Close()
 
-	tail := Start(path, Options{Poll: fastPoll})
+	tail := Start(path, -1, Options{Poll: fastPoll})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := follow(t, tail, ctx)
 
@@ -57,7 +57,7 @@ func TestTailSkipsWhatTheLogAlreadyHeldUnlessItIsAskedToReplay(t *testing.T) {
 
 	// A live watcher wants what happens from now on, not a replay of history it
 	// has already been shown.
-	later := Start(path, Options{Poll: fastPoll})
+	later := Start(path, -1, Options{Poll: fastPoll})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := follow(t, later, ctx)
 	time.Sleep(20 * fastPoll)
@@ -67,7 +67,7 @@ func TestTailSkipsWhatTheLogAlreadyHeldUnlessItIsAskedToReplay(t *testing.T) {
 	}
 	stop(t, cancel, done)
 
-	replay := Start(path, Options{FromStart: true, Poll: fastPoll})
+	replay := Start(path, -1, Options{FromStart: true, Poll: fastPoll})
 	ctx2, cancel2 := context.WithCancel(t.Context())
 	done2 := follow(t, replay, ctx2)
 	got := next(t, replay)
@@ -79,7 +79,7 @@ func TestTailSkipsWhatTheLogAlreadyHeldUnlessItIsAskedToReplay(t *testing.T) {
 
 func TestTailWaitsForALogThatDoesNotExistYet(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "later.requests.jsonl")
-	tail := Start(path, Options{Poll: fastPoll})
+	tail := Start(path, -1, Options{Poll: fastPoll})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := follow(t, tail, ctx)
 
@@ -107,7 +107,7 @@ func TestTailPublishesARecordWrittenInTwoPiecesOnlyOnceItIsWhole(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatalf("create log: %v", err)
 	}
-	tail := Start(path, Options{Poll: fastPoll})
+	tail := Start(path, -1, Options{Poll: fastPoll})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := follow(t, tail, ctx)
 	time.Sleep(20 * fastPoll)
@@ -161,7 +161,7 @@ func TestTailStartsOverWhenTheLogIsTruncated(t *testing.T) {
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close error: %v", err)
 	}
-	tail := Start(path, Options{FromStart: true, Poll: fastPoll})
+	tail := Start(path, -1, Options{FromStart: true, Poll: fastPoll})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := follow(t, tail, ctx)
 	if got := next(t, tail); got.Path != "/before" {
@@ -200,7 +200,7 @@ func TestTailDropsEventsRatherThanBlockingTheRun(t *testing.T) {
 }
 
 func TestFollowClosesTheEventChannelWhenTheContextEnds(t *testing.T) {
-	tail := Start(filepath.Join(t.TempDir(), "absent.jsonl"), Options{Poll: fastPoll})
+	tail := Start(filepath.Join(t.TempDir(), "absent.jsonl"), -1, Options{Poll: fastPoll})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := follow(t, tail, ctx)
 	cancel()
@@ -216,12 +216,51 @@ func TestFollowClosesTheEventChannelWhenTheContextEnds(t *testing.T) {
 }
 
 func TestStartDoesNotFailOnAMissingLog(t *testing.T) {
-	tail := Start(filepath.Join(t.TempDir(), "no-such-dir", "r.requests.jsonl"), Options{})
+	tail := Start(filepath.Join(t.TempDir(), "no-such-dir", "r.requests.jsonl"), -1, Options{})
 	if tail == nil {
 		t.Fatal("Start returned nil, want a usable Tail")
 	}
 	if got := tail.Dropped(); got != 0 {
 		t.Errorf("Dropped() = %d, want 0", got)
+	}
+}
+
+func TestDroppedIsSafeToAskWhileTheFollowerIsRunning(t *testing.T) {
+	// A watcher reads Dropped() on every frame to decide whether to admit it is
+	// behind, while the follower is still adding to the count. Asking is not a
+	// thing you may only do once the follower has stopped, which is exactly what
+	// tailport watch does.
+	tail := &Tail{events: make(chan Event, 4), poll: fastPoll, path: filepath.Join(t.TempDir(), "absent.jsonl")}
+
+	stop := make(chan struct{})
+	reading := make(chan struct{})
+	go func() {
+		defer close(reading)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// A count read while it is being written must never come back as
+			// something the follower never wrote.
+			if n := tail.Dropped(); n < 0 {
+				t.Errorf("Dropped() = %d while the follower was running, want a count written so far", n)
+				return
+			}
+		}
+	}()
+
+	// Nobody drains the buffer, so every pass after the first four has to drop.
+	const published = 500
+	for i := range published {
+		tail.publish(Event{Path: "/" + string(rune('a'+i%26)) + string(rune('a'+i/26))})
+	}
+	close(stop)
+	<-reading
+
+	if got, want := tail.Dropped(), published-4; got != want {
+		t.Errorf("Dropped() = %d, want %d", got, want)
 	}
 }
 
@@ -277,5 +316,48 @@ func stop(t *testing.T, cancel context.CancelFunc, done <-chan struct{}) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("Follow did not return within a second")
+	}
+}
+
+func TestTailResumesFromWhereAReadStoppedRatherThanSkippingWhatCameAfter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "r.requests.jsonl")
+	w, err := OpenWriter(path)
+	if err != nil {
+		t.Fatalf("OpenWriter error: %v", err)
+	}
+	if err := w.Append(Event{Method: "GET", Path: "/read", Status: 200}); err != nil {
+		t.Fatalf("Append error: %v", err)
+	}
+
+	// This is what a watcher does: read the history, then follow from there.
+	history, at, err := ReadTail(path, allEvents)
+	if err != nil {
+		t.Fatalf("ReadTail error: %v", err)
+	}
+	if len(history) != 1 || history[0].Path != "/read" {
+		t.Fatalf("history = %+v, want the one request already served", history)
+	}
+
+	// The share answers another request in the gap between the two calls. A tail
+	// that starts at the end of the file drops it: past the end it assumes, and
+	// behind the history that was already read.
+	if err := w.Append(Event{Method: "GET", Path: "/in-the-gap", Status: 200}); err != nil {
+		t.Fatalf("Append error: %v", err)
+	}
+
+	tail := Start(path, at, Options{Poll: fastPoll})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := follow(t, tail, ctx)
+	defer stop(t, cancel, done)
+
+	got := next(t, tail)
+	if got.Path != "/in-the-gap" {
+		t.Errorf("event path = %q, want the request served between the read and the start", got.Path)
+	}
+	if again := nextOrTimeout(t, tail, 20*fastPoll); again != nil {
+		t.Errorf("event = %+v, want the history read not replayed as well", again)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
 	}
 }

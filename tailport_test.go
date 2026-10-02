@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -442,6 +443,38 @@ func TestUsageMentionsThePortsAndFlags(t *testing.T) {
 		if !contains(text, want) {
 			t.Errorf("usage does not mention %q", want)
 		}
+	}
+}
+
+// Every command's own flag has to be in the overview, because that is all
+// `tailport <command> -h` prints: the flag sets hand their help to usage rather
+// than listing themselves. A flag missing from here is a flag nobody can find.
+func TestUsageMentionsEveryCommandsOwnFlag(t *testing.T) {
+	env, out, _ := newTestEnv(t)
+	usage(env.Out)
+	text := out.String()
+	for _, want := range []string{"-n, --lines", "-p, --port"} {
+		if !contains(text, want) {
+			t.Errorf("usage does not mention %q, so it cannot be discovered from the CLI", want)
+		}
+	}
+	// The default has to come from the constant the command actually uses, or the
+	// help and the flag can drift apart without anything noticing.
+	if want := fmt.Sprintf("default %d", historyLines); !contains(text, want) {
+		t.Errorf("usage does not say %q, so it may disagree with what watch really does", want)
+	}
+}
+
+func TestWatchHelpShowsTheWatchFlags(t *testing.T) {
+	env, _, errOut := newTestEnv(t)
+	if err := run(t.Context(), []string{"watch", "-h"}, env); err != nil {
+		t.Fatalf("run() error: %v", err)
+	}
+
+	// -h prints the overview through the flag set's own help, so this is the
+	// only place a user is told -n exists.
+	if !contains(errOut.String(), "--lines") {
+		t.Errorf("watch -h output does not mention --lines:\n%s", errOut.String())
 	}
 }
 

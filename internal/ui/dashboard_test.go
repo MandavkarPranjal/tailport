@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -88,6 +89,33 @@ func TestBarCellsMeasuresAgainstTheSlowestRequestOnScreen(t *testing.T) {
 	}
 }
 
+// A latency that never got measured must not be drawn as the slowest request on
+// screen. The chart exists to show which request was slowest, so an instant or
+// unmeasured one claiming the full width is the chart lying about the thing it
+// measures.
+func TestBarCellsGivesAnUnmeasuredRequestTheSmallestBarNotTheLargest(t *testing.T) {
+	peak := 400 * time.Millisecond
+
+	for _, in := range []time.Duration{0, -time.Second} {
+		if got := barCells(in, peak, 12); got != 1 {
+			t.Errorf("barCells(%v) = %d cells, want 1: an unmeasured latency is not the slowest request", in, got)
+		}
+	}
+
+	// A one-cell column still has to hold exactly one cell.
+	if got := barCells(0, peak, 1); got != 1 {
+		t.Errorf("barCells(0, peak, 1) = %d, want 1", got)
+	}
+
+	// And it must still lose to every request that did get measured, so it reads
+	// as the quickest thing on screen rather than the slowest.
+	instant := barCells(0, peak, 12)
+	if measured := barCells(peak, peak, 12); instant >= measured {
+		t.Errorf("an unmeasured request drew %d cells and the slowest real one drew %d, want the unmeasured one smaller",
+			instant, measured)
+	}
+}
+
 func TestLayoutRowGivesUpTheBarBeforeThePath(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -167,6 +195,24 @@ func TestRequestRowGrowsTheBarWithTheLatency(t *testing.T) {
 	if strings.Count(rowText(slow), "█") <= strings.Count(rowText(fast), "█") {
 		t.Errorf("the slow request drew %d cells and the fast one %d, want the slow one wider",
 			strings.Count(rowText(slow), "█"), strings.Count(rowText(fast), "█"))
+	}
+}
+
+// The clamp in requestRow turns a negative latency into zero before the bar is
+// measured, so a record that lost its timing must still draw the smallest bar
+// rather than the whole one.
+func TestRequestRowDrawsAnUnmeasuredRequestWithASmallBar(t *testing.T) {
+	peak := 400 * time.Millisecond
+
+	unmeasured := rowText(requestRow(reqlog.Event{Method: "GET", Status: 200, Latency: -time.Second}, rowLayout{bar: 12}, peak))
+	if got := strings.Count(unmeasured, "█"); got != 1 {
+		t.Errorf("a request with no latency drew %d bar cells, want 1: it did not take the slowest", got)
+	}
+
+	// Nothing measurable should look like the slowest request on screen.
+	slowest := rowText(requestRow(reqlog.Event{Method: "GET", Status: 200, Latency: peak}, rowLayout{bar: 12}, peak))
+	if strings.Count(unmeasured, "█") >= strings.Count(slowest, "█") {
+		t.Errorf("an unmeasured request drew as much as the slowest one:\n%s\n%s", unmeasured, slowest)
 	}
 }
 
@@ -342,6 +388,43 @@ func TestDashboardShowsTheNewestRequestsThatFit(t *testing.T) {
 	}
 }
 
+func TestBarsAreScaledAgainstTheSlowestRequestOnScreen(t *testing.T) {
+	env, out, _ := newEnv(t, "")
+	d := &dashboard{env: env, title: "port 3000", fd: -1, width: 100, height: dashChrome + 3}
+	// The slow one has scrolled off, so nobody watching can see why the bars are
+	// the width they are.
+	d.push([]reqlog.Event{
+		{Method: "GET", Path: "/gone", Status: 200, Latency: 10 * time.Second},
+		{Method: "GET", Path: "/a", Status: 200, Latency: 10 * time.Millisecond},
+		{Method: "GET", Path: "/b", Status: 200, Latency: 5 * time.Millisecond},
+		{Method: "GET", Path: "/c", Status: 200, Latency: 10 * time.Millisecond},
+	})
+
+	d.render()
+	frame := lastDashboardFrame(out)
+
+	if strings.Contains(frame, "/gone") {
+		t.Fatalf("frame = %q, want the slow request scrolled off", frame)
+	}
+	// Measured against the fastest of the three on screen, every bar is at least
+	// half the width; measured against a request nobody can see, all three would
+	// shrink to a single cell and look like the same very slow request.
+	rows := barWidthsIn(frame)
+	if len(rows) != 3 {
+		t.Fatalf("frame = %q, want the three requests on screen, got bars %v", frame, rows)
+	}
+	for i, got := range rows {
+		if got < rowBarWidth/2 {
+			t.Errorf("bar %d drew %d cells, want a bar measured against the requests on screen", i, got)
+		}
+	}
+	// The header still reports the slowest overall, which is the number that
+	// makes a scrolled-off slowness visible at all.
+	if !strings.Contains(frame, "slowest 10.00s") {
+		t.Errorf("frame = %q, want the header to still name the slowest overall", frame)
+	}
+}
+
 func TestDashboardSaysItIsWaitingBeforeAnyRequestArrives(t *testing.T) {
 	env, out, _ := newEnv(t, "")
 	d := &dashboard{env: env, title: "port 3000", fd: -1, width: 100, height: 12}
@@ -439,7 +522,74 @@ func TestKeyClearsTheLogAndQuitAsksTheDashboardToClose(t *testing.T) {
 	}
 
 	if !d.key(key{kind: keyQuit}) {
-		t.Error("keyQuit should close the dashboard")
+		t.Error("ctrl-c should close the dashboard")
+	}
+}
+
+// The footer names q as a way out, so pressing it has to be one. Reading a hint
+// that does nothing leaves the log scrolling and the user convinced it is stuck.
+func TestKeyQuitsOnQ(t *testing.T) {
+	for _, r := range []rune{'q', 'Q'} {
+		d := &dashboard{}
+		if !d.key(key{kind: keyRune, r: r}) {
+			t.Errorf("pressing %q should close the dashboard", r)
+		}
+	}
+}
+
+// The bug this covers lived between decoding a key and acting on it: readKey
+// hands back a plain q as an ordinary rune, and nothing downstream was looking
+// for it. Going through readKey keeps that gap from reopening.
+func TestQuittingFromRealTypedInput(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		input string
+	}{
+		{name: "a typed q", input: "q"},
+		{name: "a typed capital Q", input: "Q"},
+		{name: "ctrl-c", input: "\x03"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &dashboard{}
+			d.push([]reqlog.Event{{Method: "GET", Path: "/a", Status: 200}})
+
+			k, err := readKey(bufio.NewReader(strings.NewReader(tt.input)))
+			if err != nil {
+				t.Fatalf("readKey(%q) error: %v", tt.input, err)
+			}
+			if !d.key(k) {
+				t.Errorf("typing %q left the dashboard open, want it to stop", tt.input)
+			}
+		})
+	}
+}
+
+// Every key the footer offers has to be one the dashboard answers, so the hint
+// cannot quietly stop matching the code.
+func TestFooterOnlyOffersKeysThatWork(t *testing.T) {
+	d := &dashboard{title: "port 3000"}
+	d.push([]reqlog.Event{{Method: "GET", Path: "/a", Status: 200}})
+
+	hint := rowText(d.footer())
+
+	if !strings.Contains(hint, "q") {
+		t.Fatalf("footer = %q, want it to offer a plain q to stop with", hint)
+	}
+	if !strings.Contains(hint, "c to clear") {
+		t.Errorf("footer = %q, want it to offer c to clear", hint)
+	}
+
+	// The offer to clear has to reach the log, and must not take the dashboard
+	// down with it.
+	if d.key(key{kind: keyRune, r: 'c'}) {
+		t.Error("pressing c stopped the dashboard, want it to keep watching")
+	}
+	if len(d.events) != 0 {
+		t.Errorf("len(events) = %d, want the footer offer to clear to reach the log", len(d.events))
+	}
+
+	if !d.key(key{kind: keyRune, r: 'q'}) {
+		t.Error("the footer offers q, but pressing q does nothing")
 	}
 }
 
@@ -567,6 +717,18 @@ func TestPluralAgreesWithTheCount(t *testing.T) {
 	}
 }
 
+// barWidthsIn returns how many cells each latency bar on the frame took, in the
+// order they were painted.
+func barWidthsIn(frame string) []int {
+	var widths []int
+	for _, line := range strings.Split(frame, "\r\n") {
+		if n := strings.Count(line, "█"); n > 0 {
+			widths = append(widths, n)
+		}
+	}
+	return widths
+}
+
 // rowText paints segments as one plain string, the way a pipe sees a row.
 func rowText(segs []segment) string {
 	var sb strings.Builder
@@ -584,4 +746,122 @@ func lastDashboardFrame(out *bytes.Buffer) string {
 		return s[at+len("\x1b[J"):]
 	}
 	return s
+}
+
+func TestLongestPathMeasuresInCellsSoWidePathsStillLineUp(t *testing.T) {
+	events := []reqlog.Event{
+		{Path: "/ab"},  // 3 cells
+		{Path: "/日本語"}, // 7 cells
+	}
+	if got, want := longestPath(events), 7; got != want {
+		t.Errorf("longestPath = %d, want %d cells", got, want)
+	}
+}
+
+func TestTrimPathKeepsATailThatActuallyFitsTheColumn(t *testing.T) {
+	// Measured in cells, the tail has to be found by walking backwards, since
+	// counting runes off the end would overrun the column and wrap the row.
+	got := trimPath("/日本語/詳細", 5)
+	if cells(got) > 5 {
+		t.Errorf("trimPath = %q takes %d cells, want at most 5", got, cells(got))
+	}
+	if !strings.HasPrefix(got, "…") {
+		t.Errorf("trimPath = %q, want the head replaced by an ellipsis", got)
+	}
+	// A path that already fits is left exactly as it is.
+	if got := trimPath("/日本語", 99); got != "/日本語" {
+		t.Errorf("trimPath of a short path = %q, want it whole", got)
+	}
+}
+
+func TestAPathFromAClientCannotDriveTheWatchersTerminal(t *testing.T) {
+	env, _, _ := newEnv(t, "")
+	ev := reqlog.Event{Method: "GET", Path: "/\x1b[2J\x1b[H", Status: 200, Latency: time.Millisecond}
+
+	// The escape belongs to the client. A watcher is a terminal, so obeying it
+	// would let anybody who can make a request wipe the screen or repaint it.
+	if got := env.RequestLine(ev); strings.Contains(got, "\x1b") {
+		t.Errorf("RequestLine = %q, want the escape shown rather than passed on", got)
+	}
+	if got := rowText(requestRow(ev, rowLayout{}, 0)); strings.Contains(got, "\x1b") {
+		t.Errorf("row = %q, want the escape shown rather than painted", got)
+	}
+}
+
+func TestAPathThatDecodesToANewlineStaysOnOneLine(t *testing.T) {
+	env, _, _ := newEnv(t, "")
+	// net/http decodes %0A in the request target into a real newline, so this is
+	// a path a client really can ask for.
+	ev := reqlog.Event{Method: "GET", Path: "/a\nb", Status: 200}
+
+	got := env.RequestLine(ev)
+
+	if strings.Contains(got, "\n") || strings.Contains(got, "\r") {
+		t.Errorf("RequestLine = %q, want one line per request however the client spelled it", got)
+	}
+	if !strings.Contains(got, `\n`) {
+		t.Errorf("RequestLine = %q, want the newline spelled out", got)
+	}
+}
+
+func TestEveryRequestFieldIsEscapedAndNotJustThePath(t *testing.T) {
+	tests := []struct {
+		name string
+		ev   reqlog.Event
+		want string
+	}{
+		{
+			name: "a method carrying an escape",
+			ev:   reqlog.Event{Method: "GE\x1b[31mT", Path: "/", Status: 200},
+			want: `\x1b`,
+		},
+		{
+			name: "a carriage return in the method",
+			ev:   reqlog.Event{Method: "GET\r", Path: "/", Status: 200},
+			want: `\r`,
+		},
+		{
+			name: "a delete character in the method",
+			ev:   reqlog.Event{Method: "GET\x7f", Path: "/", Status: 200},
+			want: `\x7f`,
+		},
+		{
+			name: "an error carrying a newline",
+			ev: reqlog.Event{
+				Method: "GET", Path: "/", Status: 502,
+				Latency: time.Millisecond, Error: "connection refused\nGET /admin",
+			},
+			want: `\n`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env, _, _ := newEnv(t, "")
+
+			got := env.RequestLine(tt.ev)
+
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("RequestLine = %q, want the control character spelled out as %q", got, tt.want)
+			}
+			if strings.ContainsAny(got, "\x1b\n\r\x7f") {
+				t.Errorf("RequestLine = %q, want no control characters left in it", got)
+			}
+		})
+	}
+}
+
+func TestColumnsLineUpWhenAPathIsLongerOnceItIsEscaped(t *testing.T) {
+	plain := reqlog.Event{Method: "GET", Path: "/abcd", Status: 200, Latency: time.Millisecond}
+	nasty := reqlog.Event{Method: "GET", Path: "/\x1b[31m", Status: 200, Latency: time.Millisecond}
+	shown := []reqlog.Event{plain, nasty}
+
+	// The layout divides the terminal by the widest path on screen, so it has to
+	// measure what gets printed. The escape turns a five byte path into nine
+	// printed characters, and measuring the raw bytes would push the status and
+	// latency columns out past where they belong.
+	row := rowText(requestRow(nasty, layoutRow(120, longestPath(shown)), time.Millisecond))
+
+	if want := rowFixed + cells(printable(nasty.Path)) + rowBarWidth; cells(row) != want {
+		t.Errorf("row is %d cells wide, want %d so the columns still line up", cells(row), want)
+	}
 }

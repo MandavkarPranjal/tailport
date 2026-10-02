@@ -599,3 +599,68 @@ func TestCutKeepsWholeRunes(t *testing.T) {
 		t.Errorf("cut to nothing = %q, want an empty string", got)
 	}
 }
+
+func TestCellsCountsTerminalCellsRatherThanRunes(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want int
+	}{
+		{name: "plain ascii is one cell each", in: "abc", want: 3},
+		{name: "accented latin is still one cell each", in: "héllo", want: 5},
+		// A rune is not a cell: a CJK character is drawn two cells wide, so
+		// counting runes here would let a row overrun the terminal and wrap.
+		{name: "a wide character takes two cells", in: "日本語", want: 6},
+		{name: "wide and narrow mix", in: "a日b", want: 4},
+		// A combining accent is drawn on top of the character before it and
+		// costs nothing, so counting it would push the row out early.
+		{name: "a combining accent takes no cell of its own", in: "é", want: 1},
+		{name: "combining marks after a base cost nothing", in: "éx", want: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cells(tt.in); got != tt.want {
+				t.Errorf("cells(%q) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCutMeasuresInCellsAndLeavesARuneWhole(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		n    int
+		want string
+	}{
+		{name: "a wide character does not fit in one cell and is left out whole", in: "日x", n: 1, want: ""},
+		{name: "one wide character fills two cells", in: "日x", n: 2, want: "日"},
+		{name: "a wide and a narrow one fit in three cells", in: "日x", n: 3, want: "日x"},
+		// Cutting mid-rune would leave a broken character on screen.
+		{name: "a rune is never cut in half", in: "a日", n: 2, want: "a"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cut(tt.in, tt.n); got != tt.want {
+				t.Errorf("cut(%q, %d) = %q, want %q", tt.in, tt.n, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestScreenDoesNotWrapALineFullOfWideCharacters(t *testing.T) {
+	env, _, _ := newEnv(t, "")
+	// Wide enough for six cells of path, which is three CJK characters, and too
+	// narrow for four.
+	s := newScreen(env, 7)
+
+	s.write(segment{"日本語です", stylePlain})
+
+	line := strings.TrimSuffix(s.sb.String(), "\r\n")
+	if got := cells(line); got > 6 {
+		t.Errorf("line = %q takes %d cells, want at most 6 so it cannot wrap", line, got)
+	}
+	if s.lines != 1 {
+		t.Errorf("lines = %d, want 1: a wrapped line would have cost a row nobody counted", s.lines)
+	}
+}

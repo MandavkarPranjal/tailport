@@ -47,17 +47,19 @@ func watch(ctx context.Context, args []string, env *ui.Env) error {
 		env.Hint("Port %d has exited; showing the requests it recorded.", run.Port)
 	}
 
+	// Only the requested tail is read. A share can have been serving for hours,
+	// and the dashboard shows a screenful, so loading the whole log would make
+	// the watcher hold far more than it can ever display.
 	path := reqlog.Path(dir, run.PID)
-	history, err := reqlog.ReadAll(path)
+	history, at, err := reqlog.ReadTail(path, *lines)
 	if err != nil {
 		return err
 	}
-	if n := *lines; n >= 0 && len(history) > n {
-		history = history[len(history)-n:]
-	}
-	// Start the tail only after the history is read. The tail picks up where the
-	// file already ends, so this ordering shows every request exactly once.
-	tail := reqlog.Start(path, reqlog.Options{})
+	// The tail starts where the read above stopped rather than at the end of the
+	// log, so a request served in between is shown by one or the other. Starting
+	// at the end would drop it: past the end the tail assumes, and behind the
+	// history that has already been read.
+	tail := reqlog.Start(path, at, reqlog.Options{})
 	go tail.Follow(ctx)
 
 	return env.Dashboard(ctx, watchTitle(run), history, tail.Events(), tail.Dropped)

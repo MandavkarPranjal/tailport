@@ -9,8 +9,15 @@ import (
 )
 
 // Observer is told about every request the proxy serves, once the outcome is
-// known. It runs on the server goroutine that served the request, so it has to
-// be safe to call from several goroutines at once and must not block for long.
+// known. It runs on the server goroutine that served the request, before the
+// handler returns and so before a small response body is flushed.
+//
+// That makes it a latency question, not just a locking one: whatever an observer
+// costs is added to what the client waits for. An observer must therefore be safe
+// to call from several goroutines at once and must not block, and it must not
+// write to disk itself. reqlog.Writer.Observe is the observer tailport supplies,
+// and it hands the event to a queue instead of writing it, so recording a request
+// costs a channel send rather than an operating system call.
 type Observer func(reqlog.Event)
 
 // trackerKey is the context key the per-request record is filed under. It is an

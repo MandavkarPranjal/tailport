@@ -43,13 +43,43 @@ func Loopback(port int) Target {
 // observers the handler does no extra work at all, which matters because this is
 // the path every request through a share takes.
 func Handler(target Target, logger *log.Logger, observers ...Observer) http.Handler {
+	proxy := newProxy(target, logger, len(observers) > 0)
+	if len(observers) == 0 {
+		return proxy
+	}
+	return observe(proxy, observers...)
+}
+
+// newProxy builds the reverse proxy. track says whether some layer is watching
+// the requests, which is not the same question as whether this handler has
+// observers of its own: Mount observes outside the proxy so that it sees the
+// path the client asked for, and it needs the outcome recorded from in here.
+//
+// When nothing is watching, the callbacks that would look for the tracker are not
+// installed at all. Leaving them in costs a context lookup on every request that
+// comes back from the upstream, which is every request, to find nothing.
+func newProxy(target Target, logger *log.Logger, track bool) http.Handler {
 	u := &url.URL{Scheme: "http", Host: target.String()}
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(u)
 			r.Out.Host = r.In.Host
 		},
-		ModifyResponse: func(resp *http.Response) error {
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if logger != nil {
+				logger.Printf("proxy %s %s: %v", r.Method, r.URL.Path, err)
+			}
+			if track {
+				if t := tracked(r); t != nil {
+					t.status = http.StatusBadGateway
+					t.err = err.Error()
+				}
+			}
+			http.Error(w, "tailport cannot reach "+target.String(), http.StatusBadGateway)
+		},
+	}
+	if track {
+		proxy.ModifyResponse = func(resp *http.Response) error {
 			// The upstream answered, so its status is the status the client gets.
 			// ModifyResponse is not called for a request that failed to round
 			// trip, so nothing here can overwrite a 502.
@@ -57,22 +87,9 @@ func Handler(target Target, logger *log.Logger, observers ...Observer) http.Hand
 				t.status = resp.StatusCode
 			}
 			return nil
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if logger != nil {
-				logger.Printf("proxy %s %s: %v", r.Method, r.URL.Path, err)
-			}
-			if t := tracked(r); t != nil {
-				t.status = http.StatusBadGateway
-				t.err = err.Error()
-			}
-			http.Error(w, "tailport cannot reach "+target.String(), http.StatusBadGateway)
-		},
+		}
 	}
-	if len(observers) == 0 {
-		return proxy
-	}
-	return observe(proxy, observers...)
+	return proxy
 }
 
 // Mount returns target behind a path prefix, so a service that does not expect
@@ -86,7 +103,10 @@ func Handler(target Target, logger *log.Logger, observers ...Observer) http.Hand
 // because the client really did get a 404; leaving it out would make the counts
 // in a watch disagree with what the callers saw.
 func Mount(target Target, prefix string, logger *log.Logger, observers ...Observer) http.Handler {
-	inner := Handler(target, logger)
+	// The observers are attached outside the proxy, so the proxy still has to
+	// record the outcome. Asking for tracking here rather than passing the
+	// observers down is what keeps that true.
+	inner := newProxy(target, logger, len(observers) > 0)
 	clean := "/" + strings.Trim(prefix, "/")
 	if clean == "/" {
 		if len(observers) == 0 {
@@ -110,6 +130,12 @@ func Mount(target Target, prefix string, logger *log.Logger, observers ...Observ
 	mux.Handle(clean, mounted)
 	mux.Handle(clean+"/", mounted)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// This 404 is the whole answer to the request, and nobody downstream sets
+		// it, so the tracker is told here. Leaving it unset would record the
+		// request as status 0, which reads as a request that never got one at all.
+		if t := tracked(r); t != nil {
+			t.status = http.StatusNotFound
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte("<!doctype html><meta charset=utf-8>" +

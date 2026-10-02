@@ -1,6 +1,7 @@
 package state
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -186,6 +187,52 @@ func TestPruneKeepsLiveRunsAndDropsDeadOnes(t *testing.T) {
 	}
 	if _, err := Load(dir, live.PID); err != nil {
 		t.Errorf("live run record was removed: %v", err)
+	}
+}
+
+// A run killed rather than stopped leaves its request log behind, and nothing
+// else will ever clear it, so Prune has to. The log sits beside the record that
+// says whether its run is still alive, so the decision has to be made while that
+// record is still readable.
+func TestPruneRemovesTheRequestLogOfADeadRun(t *testing.T) {
+	dir := t.TempDir()
+	dead := sample(deadPID(t), 3001, time.Now().Add(-time.Hour))
+	if err := Save(dir, dead); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	log := filepath.Join(Dir(dir), fmt.Sprintf("%d%s", dead.PID, requestLogSuffix))
+	if err := os.WriteFile(log, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	if _, err := Prune(dir); err != nil {
+		t.Fatalf("Prune() error: %v", err)
+	}
+
+	if _, err := os.Stat(log); !os.IsNotExist(err) {
+		t.Errorf("the request log of a dead run survived Prune(), stat error = %v", err)
+	}
+}
+
+// A live share is still serving, so its log is still wanted even though Prune
+// walks right past its record.
+func TestPruneKeepsTheRequestLogOfALiveRun(t *testing.T) {
+	dir := t.TempDir()
+	live := sample(os.Getpid(), 3000, time.Now())
+	if err := Save(dir, live); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	log := filepath.Join(Dir(dir), fmt.Sprintf("%d%s", live.PID, requestLogSuffix))
+	if err := os.WriteFile(log, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	if _, err := Prune(dir); err != nil {
+		t.Fatalf("Prune() error: %v", err)
+	}
+
+	if _, err := os.Stat(log); err != nil {
+		t.Errorf("the request log of a live run was removed: %v", err)
 	}
 }
 

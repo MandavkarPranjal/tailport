@@ -9,9 +9,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/MandavkarPranjal/tailport/internal/state"
@@ -56,21 +59,46 @@ func Path(stateDir string, pid int) string {
 // Writer appends events to a run's request log. It is safe to call from every
 // server goroutine at once.
 //
-// Records go to the file immediately rather than through a buffer, because the
-// whole point of the log is that a watcher following it sees requests as they
-// happen. Batching eight kilobytes of records would keep a live view blank for
-// as long as a share stayed quiet, which is exactly when somebody is watching to
-// see whether anything is wrong.
+// Records reach the file as soon as a goroutine can write them, rather than
+// sitting in a buffer, because the whole point of the log is that a watcher
+// following it sees requests as they happen. Batching eight kilobytes of records
+// would keep a live view blank for as long as a share stayed quiet, which is
+// exactly when somebody is watching to see whether anything is wrong.
 type Writer struct {
-	mu     sync.Mutex
-	file   *os.File
+	mu   sync.Mutex
+	file *os.File
+	// stopped is set by Close: no further events are accepted and the queue is
+	// shut. The file itself is closed by the drain goroutine, but only once it
+	// has written everything already queued, so nothing accepted is ever lost.
+	stopped bool
+	// closed records that the file is closed, which happens strictly after
+	// stopped. Append reports errClosed rather than an operating system error, so
+	// a request still in flight when a run shuts down hears why.
 	closed bool
+	// queue is what Observe hands events to, and drained is closed once the
+	// goroutine taking from it has finished.
+	queue   chan Event
+	drained chan struct{}
+	// closeErr is the result of closing the file, written before drained is
+	// closed so that Close can read it safely.
+	closeErr error
+	// dropped counts the events Observe had to throw away because the queue was
+	// full.
+	dropped atomic.Int64
 }
+
+// queueDepth is how many events may be waiting to be written before the log
+// starts dropping them. It is a few times what a screen shows, so a burst costs
+// the writer nothing, and bounded, so that a share serving faster than the disk
+// can record cannot grow its queue until it takes the service down with it.
+const queueDepth = 1024
 
 // OpenWriter prepares a run's request log for appending, creating the state
 // directory if it needs to. An existing log is truncated: it is keyed by pid, so
 // anything already there belongs to a run that reused this pid and is not worth
 // replaying.
+//
+// It starts a goroutine to write what Observe queues, and Close is what stops it.
 func OpenWriter(path string) (*Writer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create state directory: %w", err)
@@ -79,12 +107,28 @@ func OpenWriter(path string) (*Writer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open request log: %w", err)
 	}
-	return &Writer{file: file}, nil
+	w := &Writer{
+		file:    file,
+		queue:   make(chan Event, queueDepth),
+		drained: make(chan struct{}),
+	}
+	go w.drain()
+	return w, nil
 }
 
-// Append records one event. The line is written straight through in a single
-// write, so a follower sees it as soon as it lands.
-func (w *Writer) Append(e Event) error {
+// drain writes queued events one at a time, and then closes the file. Doing both
+// here is what lets Close be one step: shut the queue and wait for it.
+func (w *Writer) drain() {
+	defer close(w.drained)
+	for e := range w.queue {
+		_ = w.write(e)
+	}
+	w.closeErr = w.closeFile()
+}
+
+// write puts one event on disk in a single write, so a follower sees it as soon
+// as it lands.
+func (w *Writer) write(e Event) error {
 	data, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("encode request log entry: %w", err)
@@ -102,17 +146,53 @@ func (w *Writer) Append(e Event) error {
 	return nil
 }
 
-// Observe is Append shaped to be handed to a proxy as an observer. A log that
-// cannot be written is not worth failing a request the service already answered,
-// so the error is dropped: the request is served either way, and the only
-// consequence is a gap in what `tailport watch` can show.
-func (w *Writer) Observe(e Event) {
-	_ = w.Append(e)
+// Append records one event before returning, so a caller that needs the record on
+// disk has it. Prefer Observe on anything answering a request.
+func (w *Writer) Append(e Event) error {
+	w.mu.Lock()
+	stopped := w.stopped
+	w.mu.Unlock()
+	if stopped {
+		return errClosed
+	}
+	return w.write(e)
 }
 
-// Close closes the file. Calling it twice is safe, so a deferred Close next to
-// an explicit one does not panic.
-func (w *Writer) Close() error {
+// Observe is Append shaped to be handed to a proxy as an observer.
+//
+// It hands the event to a goroutine and returns, because it runs on the goroutine
+// that just finished answering a request: a client waiting on a share should not
+// be waiting on this share's disk either. A log that cannot be written is not
+// worth failing a request the service already answered, so the only consequence
+// of losing one is a gap in what `tailport watch` can show.
+//
+// The queue is bounded, and a full queue drops the newest event rather than
+// blocking. Dropping is the right way round: a request log is a record of what a
+// share was doing, and holding up the requests being served to keep that record
+// complete would trade away the thing the share exists to do. Dropped() says how
+// many were lost, so a log can admit it is short instead of quietly lying about
+// how much it saw.
+func (w *Writer) Observe(e Event) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stopped {
+		return
+	}
+	select {
+	case w.queue <- e:
+	default:
+		w.dropped.Add(1)
+	}
+}
+
+// Dropped reports how many events Observe had to throw away because the queue was
+// full. It is safe to ask while a run is being served.
+func (w *Writer) Dropped() int {
+	return int(w.dropped.Load())
+}
+
+// closeFile closes the file once, and reports what happened if it had to.
+func (w *Writer) closeFile() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -123,6 +203,25 @@ func (w *Writer) Close() error {
 		return fmt.Errorf("close request log: %w", err)
 	}
 	return nil
+}
+
+// Close stops accepting events, waits for the ones already queued to be written,
+// and then closes the file. Calling it twice is safe, so a deferred Close next to
+// an explicit one does not panic.
+func (w *Writer) Close() error {
+	w.mu.Lock()
+	if w.stopped {
+		w.mu.Unlock()
+		return nil
+	}
+	w.stopped = true
+	close(w.queue)
+	w.mu.Unlock()
+
+	// Waiting for the drain to finish is what keeps the log honest: a share that
+	// shuts down must not lose the requests it served on its way out.
+	<-w.drained
+	return w.closeErr
 }
 
 // errClosed marks an append to a log that has already been closed, which
@@ -143,33 +242,102 @@ func Remove(stateDir string, pid int) error {
 	return nil
 }
 
-// ReadAll returns every event already written to a log. A line that does not
-// parse is skipped rather than failing the read, because a partially written
-// final line is normal while a run is still serving.
-func ReadAll(path string) ([]Event, error) {
+// maxLine is the longest request log line ReadTail will consider.
+//
+// A request path is not short by construction: net/http accepts a request line
+// up to DefaultMaxHeaderBytes, and every byte of one can come back out of JSON
+// as a six byte escape such as "	". A valid request therefore writes a
+// line up to roughly six times the header limit, so a token limit below that
+// would fail the read on a request tailport really did serve and abort a watch
+// that was working. Rounding up leaves room for the other fields and for the
+// growth those bounds leave behind.
+//
+// A line past this is treated as unreadable rather than fatal, the same as a
+// line that will not parse, so one corrupt record cannot end a watch.
+const maxLine = 8 * http.DefaultMaxHeaderBytes
+
+// ReadTail returns the last n events already written to a log, oldest first, and
+// the byte offset it read up to. A count of zero or less asks for no events at
+// all, which is what somebody watching only what happens from now on wants.
+//
+// The offset is the other half of the result because reading the past and
+// following the future are two halves of one job, and only a reader that knows
+// where it stopped can be handed to a follower without a gap. A caller that has
+// just read a log should start the tail at this offset rather than at the end of
+// the file: a request appended between the two would be past the end the tail
+// assumes and behind the read the tail is meant to continue, so it would appear
+// in neither. Pass the offset to Options.Offset.
+//
+// Only the tail is kept, because a log belongs to a run that may have been
+// serving for hours: a share left up over a busy afternoon records far more
+// requests than any screen shows, and reading all of them would make the memory
+// a watcher needs grow with the log rather than with what it displays. The file
+// is still scanned end to end, since the newest records are at the end, but
+// nothing beyond the tail is ever held.
+//
+// A line that does not parse is skipped rather than failing the read, because a
+// partially written final line is normal while a run is still serving.
+func ReadTail(path string, n int) ([]Event, int64, error) {
+	if n <= 0 {
+		return nil, lengthOf(path), nil
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, 0, nil
 		}
-		return nil, fmt.Errorf("open request log: %w", err)
+		return nil, 0, fmt.Errorf("open request log: %w", err)
 	}
 	defer file.Close()
 
-	var events []Event
+	// The tail is held in a ring of exactly n, so a run with more requests than
+	// that costs one memmove per line instead of an ever-growing slice.
+	events := make([]Event, 0, n)
 	scanner := bufio.NewScanner(file)
-	// A request line is small, but a path can be long and there is no reason to
-	// cap it at the default 64KiB.
-	scanner.Buffer(make([]byte, 0, 8<<10), 1<<20)
+	scanner.Buffer(make([]byte, 0, 8<<10), maxLine)
 	for scanner.Scan() {
-		if e, ok := decode(scanner.Bytes()); ok {
-			events = append(events, e)
+		e, ok := decode(scanner.Bytes())
+		if !ok {
+			continue
 		}
+		if len(events) == n {
+			copy(events, events[1:])
+			events[n-1] = e
+			continue
+		}
+		events = append(events, e)
+	}
+	// Where the file was left is the other half of the answer, so a follower can
+	// pick up from here rather than from wherever the log has got to by the time
+	// it starts. The scanner stops on the last whole line it read, which is
+	// exactly the boundary a record appended after this moment belongs past.
+	at, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return events, 0, fmt.Errorf("read request log offset: %w", err)
 	}
 	if err := scanner.Err(); err != nil {
-		return events, fmt.Errorf("read request log: %w", err)
+		if errors.Is(err, bufio.ErrTooLong) {
+			// The log holds a line no request could have produced, so it is
+			// corrupt or was truncated by something else. Whatever was readable
+			// before it is still worth showing, and a watcher is more useful than
+			// a complaint. The offset is left at zero, so a tail resuming from it
+			// replays the readable part rather than skipping it.
+			return events, 0, nil
+		}
+		return events, 0, fmt.Errorf("read request log: %w", err)
 	}
-	return events, nil
+	return events, at, nil
+}
+
+// lengthOf is how long a log is right now, for the caller that wants no events
+// from it but still needs to know where the log ends. A log that does not exist
+// is zero, which is also where a follower should wait for it.
+func lengthOf(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 // decode parses one line, reporting false for a line that is not a whole event.

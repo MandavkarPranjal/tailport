@@ -29,7 +29,7 @@ Usage:
   tailport version                print the version
   tailport help                   print this text
 
-Run "tailport up -h" for the flags of a command.
+Run "tailport up -h" or "tailport watch -h" for the flags of a command.
 
 Sharing flags:
   -p, --port PORT        local port to share (skips the menu)
@@ -39,6 +39,10 @@ Sharing flags:
       --private          share inside the tailnet only, never on the public web
   -d, --daemon           run in the background and keep serving after tailport exits
   -y, --yes              never prompt; requires --port
+
+Watch flags:
+  -n, --lines N          past requests to show before the live feed (default %[4]d;
+                         0 shows only what arrives from now on)
 
 Node flags:
       --hostname NAME    node name in your tailnet (default %[1]q)
@@ -55,7 +59,8 @@ Examples:
   tailport status                  what is shared, and since when
   tailport watch                   live request log for a share
   tailport watch 3000              live request log for port 3000
+  tailport watch -n 0              live request log, past requests left out
   tailport stop                    stop sharing everything
 `,
-		node.Name, ports, node.DefaultPublicPort)
+		node.Name, ports, node.DefaultPublicPort, historyLines)
 }

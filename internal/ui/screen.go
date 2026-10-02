@@ -2,9 +2,10 @@ package ui
 
 import (
 	"strings"
-	"unicode/utf8"
+	"unicode"
 
 	"golang.org/x/term"
+	"golang.org/x/text/width"
 )
 
 // size re-reads the terminal size, so a resize is picked up between frames. It
@@ -71,18 +72,25 @@ func newScreen(env *Env, width int) *screen {
 // before it. Trimming to the width is what lets the next frame move back up by
 // an exact number of lines.
 func (f *screen) write(segs ...segment) {
-	limit := 0
-	if f.width > 2 {
+	// A width of 0 means the size could not be read, which leaves the lines
+	// alone. A width of 1 or 2 is a real terminal, however narrow, and still has
+	// to be clipped: a line that wraps costs a row nobody counted, and the next
+	// frame then steps back up by the wrong number and lands in the wrong place.
+	// Clipping to zero cells is the honest answer there, not an unlimited line.
+	limit, clip := 0, f.width > 0
+	if clip {
 		limit = f.width - 1
 	}
 
 	used := 0
 	for _, s := range segs {
 		text := s.text
-		if limit > 0 && len(text) > limit-used {
+		if clip && cells(text) > limit-used {
+			// cut returns nothing for a room that has already run out, so a line
+			// cannot overrun by running past its limit.
 			text = cut(text, limit-used)
 		}
-		used += utf8.RuneCountInString(text)
+		used += cells(text)
 		f.sb.WriteString(paint(f.env, s.style, text))
 	}
 	f.sb.WriteString("\r\n")
@@ -108,17 +116,50 @@ func paint(e *Env, s style, text string) string {
 	return text
 }
 
-// cut shortens s to at most n runes without splitting one.
+// cells is how many terminal cells s takes up, which is not the same as the
+// number of runes in it. A CJK character is drawn two cells wide and a combining
+// accent none at all, so measuring a row in runes lets it overrun the terminal
+// and wrap, and a frame that wrapped costs a row nobody counted: the next repaint
+// steps back up by the wrong amount and the log ends up painted over itself.
+func cells(s string) int {
+	n := 0
+	for _, r := range s {
+		n += cellWidth(r)
+	}
+	return n
+}
+
+// cellWidth is how many terminal cells one rune occupies.
+func cellWidth(r rune) int {
+	if r == 0 {
+		return 0
+	}
+	if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) {
+		// Combining marks ride on the character before them and take no room of
+		// their own, so counting them would overcount the row.
+		return 0
+	}
+	switch width.LookupRune(r).Kind() {
+	case width.EastAsianWide, width.EastAsianFullwidth:
+		return 2
+	}
+	return 1
+}
+
+// cut shortens s to at most n terminal cells without splitting one.
 func cut(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	count := 0
-	for i := range s {
-		if count == n {
+	used := 0
+	for i, r := range s {
+		w := cellWidth(r)
+		// A rune that is already too wide for the room left is left out whole
+		// rather than cut in half, which would be a broken character.
+		if used+w > n {
 			return s[:i]
 		}
-		count++
+		used += w
 	}
 	return s
 }
