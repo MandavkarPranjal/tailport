@@ -22,6 +22,7 @@ Usage:
   tailport                        pick a port from a menu and share it
   tailport up [flags]             share a port, given or chosen
   tailport status                 show what tailport is sharing right now
+  tailport watch [port]           watch the requests a share is serving, live
   tailport stop [port]            stop sharing, all of it or just one port
   tailport list                   list local listening ports
   tailport login                  log the %[1]s node in ahead of time
@@ -52,6 +53,8 @@ Examples:
   tailport up -p 3000 --private    share port 3000 inside the tailnet only
   tailport up -p 3000 -d           share port 3000 in the background
   tailport status                  what is shared, and since when
+  tailport watch                   live request log for a share
+  tailport watch 3000              live request log for port 3000
   tailport stop                    stop sharing everything
 `,
 		node.Name, ports, node.DefaultPublicPort)

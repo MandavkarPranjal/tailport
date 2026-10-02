@@ -12,6 +12,7 @@ import (
 	"github.com/MandavkarPranjal/tailport/internal/daemon"
 	"github.com/MandavkarPranjal/tailport/internal/node"
 	"github.com/MandavkarPranjal/tailport/internal/proxy"
+	"github.com/MandavkarPranjal/tailport/internal/reqlog"
 	"github.com/MandavkarPranjal/tailport/internal/state"
 	"github.com/MandavkarPranjal/tailport/internal/ui"
 )
@@ -69,6 +70,20 @@ func serveWith(ctx context.Context, env *ui.Env, opts shareOpts, pid int, logPat
 		logs = log.New(file, "", log.LstdFlags)
 	}
 
+	// Every run leaves a request log next to its state record, which is what
+	// makes a share watchable from another terminal with `tailport watch`.
+	requests, err := reqlog.OpenWriter(reqlog.Path(stateDir, pid))
+	if err != nil {
+		return err
+	}
+	// The log is unlinked on the way out, but only once it has been closed, so a
+	// watcher following it sees the run end instead of the file disappearing
+	// mid-read. The inner defer is registered last, so it runs first.
+	defer func() {
+		defer func() { _ = reqlog.Remove(stateDir, pid) }()
+		_ = requests.Close()
+	}()
+
 	n, err := start(ctx, opts.nodeConfig(func(format string, args ...any) {
 		logs.Printf(format, args...)
 	}), func(url string) {
@@ -80,7 +95,7 @@ func serveWith(ctx context.Context, env *ui.Env, opts shareOpts, pid int, logPat
 	}
 	defer n.Close()
 
-	handler := proxy.Mount(proxy.Loopback(opts.Port), opts.Path, logs)
+	handler := proxy.Mount(proxy.Loopback(opts.Port), opts.Path, logs, requests.Observe)
 	servers := make([]*http.Server, 0, 4)
 	listeners := make([]net.Listener, 0, 4)
 

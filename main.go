@@ -60,6 +60,8 @@ func run(ctx context.Context, args []string, env *ui.Env) error {
 		err = serve(ctx, args, env, startNode)
 	case "status":
 		err = status(ctx, args, env)
+	case "watch":
+		err = watch(ctx, args, env)
 	case "stop":
 		err = stop(ctx, args, env)
 	case "list":

@@ -87,6 +87,9 @@ func (e *Env) Yellow(s string) string { return e.paint("33", s) }
 // Cyan renders s in cyan.
 func (e *Env) Cyan(s string) string { return e.paint("36", s) }
 
+// Red renders s in red.
+func (e *Env) Red(s string) string { return e.paint("31", s) }
+
 // Title prints a section heading.
 func (e *Env) Title(format string, args ...any) {
 	fmt.Fprintf(e.Out, "%s\n", e.Bold(fmt.Sprintf(format, args...)))
@@ -119,7 +122,7 @@ func (e *Env) Notice(format string, args ...any) {
 
 // Errorf prints an error line to stderr.
 func (e *Env) Errorf(format string, args ...any) {
-	fmt.Fprintf(e.Err, "%s %s\n", e.paint("31", "error:"), fmt.Sprintf(format, args...))
+	fmt.Fprintf(e.Err, "%s %s\n", e.Red("error:"), fmt.Sprintf(format, args...))
 }
 
 // Hint prints a dimmed follow-up line to stderr.
