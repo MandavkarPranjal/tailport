@@ -389,8 +389,17 @@ func TestObserveDoesNotWriteOnTheCallersGoroutine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWriter error: %v", err)
 	}
+	// Shut the real drain goroutine off and take the queue by hand, so what is on
+	// disk is decided by this test rather than by whichever goroutine got there
+	// first. Asserting an empty log while a drain is racing to write it would
+	// fail against a correct implementation.
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("OpenFile error: %v", err)
+	}
+	detached := &Writer{file: file, queue: make(chan Event, queueDepth)}
 
-	w.Observe(Event{Method: "GET", Path: "/on-the-serving-goroutine", Status: 200})
+	detached.Observe(Event{Method: "GET", Path: "/on-the-serving-goroutine", Status: 200})
 
 	// Observe runs on the goroutine that just answered a request, before the
 	// handler returns and so before a small body is flushed. If it wrote the
@@ -399,6 +408,28 @@ func TestObserveDoesNotWriteOnTheCallersGoroutine(t *testing.T) {
 		t.Fatalf("ReadTail error: %v", err)
 	} else if len(got) != 0 {
 		t.Errorf("events = %+v, want Observe to hand the record off instead of writing it", got)
+	}
+
+	// Handing off is only safe because the record does land, so the goroutine
+	// that takes the queue has to be the one to write it.
+	close(detached.queue)
+	for e := range detached.queue {
+		if err := detached.write(e); err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+	got, _, err := ReadTail(path, allEvents)
+	if err != nil {
+		t.Fatalf("ReadTail error: %v", err)
+	}
+	if len(got) != 1 || got[0].Path != "/on-the-serving-goroutine" {
+		t.Errorf("events = %+v, want the handed off request written once", got)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
 	}
 }
 
@@ -464,5 +495,217 @@ func TestDroppedCountsNothingWhenTheQueueKeptUp(t *testing.T) {
 
 	if got := w.Dropped(); got != 0 {
 		t.Errorf("Dropped() = %d, want 0 for a queue that kept up", got)
+	}
+}
+
+// quietWriter is a Writer with no drain goroutine, so a test decides exactly when
+// records land and can assert what is and is not on disk yet. The real
+// OpenWriter is still what creates the file, so the path and the permissions are
+// the real ones.
+func quietWriter(t *testing.T, depth int) (*Writer, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "requests.jsonl")
+	w, err := OpenWriter(path)
+	if err != nil {
+		t.Fatalf("OpenWriter() error: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	return &Writer{file: w.file, queue: make(chan Event, depth), drained: make(chan struct{})}, path
+}
+
+// drainQuietly runs the drain by hand, the way Close expects to find it running.
+func drainQuietly(t *testing.T, w *Writer) {
+	t.Helper()
+	go w.drain()
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+}
+
+// logAt reads every record a log ends up holding. A zero limit would ask for no
+// records at all, which is the right answer for a watcher and the wrong one here.
+func logAt(t *testing.T, path string) []Event {
+	t.Helper()
+	events, _, err := ReadTail(path, 1000)
+	if err != nil {
+		t.Fatalf("ReadTail() error: %v", err)
+	}
+	return events
+}
+
+// noticesIn counts the announcements a log made about its own gaps.
+func noticesIn(events []Event) []string {
+	var out []string
+	for _, ev := range events {
+		if ev.Notice != "" {
+			out = append(out, ev.Notice)
+		}
+	}
+	return out
+}
+
+func TestAFailedWriteIsReportedWhenTheLogCloses(t *testing.T) {
+	w, _ := quietWriter(t, 4)
+	w.queue <- Event{Method: "GET", Path: "/a", Status: 200}
+
+	// Close the file behind the writer's back. This is the shape of the problem:
+	// the writer is open and believes it is serving, and the disk underneath it
+	// has stopped taking anything. Whoever asked for the request must not find
+	// out, but whoever closed the run has to.
+	if err := w.file.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+
+	go w.drain()
+	err := w.Close()
+
+	if err == nil {
+		t.Fatal("Close() = nil, want the write that could not land reported")
+	}
+	if !strings.Contains(err.Error(), "write request log") {
+		t.Errorf("Close() = %q, want it to name the write that failed", err)
+	}
+}
+
+func TestALogThatWroteEverythingClosesWithoutComplaint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "requests.jsonl")
+	w, err := OpenWriter(path)
+	if err != nil {
+		t.Fatalf("OpenWriter() error: %v", err)
+	}
+	w.Observe(Event{Method: "GET", Path: "/a", Status: 200})
+
+	if err := w.Close(); err != nil {
+		t.Errorf("Close() = %v, want nil when every record landed", err)
+	}
+	if got := logAt(t, path); len(got) != 1 {
+		t.Errorf("the log holds %d records, want the one that was observed", len(got))
+	}
+}
+
+func TestDropsAreWrittenIntoTheLogSoAWatcherCanSeeThem(t *testing.T) {
+	w, path := quietWriter(t, 2)
+
+	// Two fit and the next two cannot, which is the shape of a share serving
+	// faster than its disk can record.
+	for i := range 4 {
+		w.Observe(Event{Method: "GET", Path: fmt.Sprintf("/%d", i), Status: 200})
+	}
+	if got := w.Dropped(); got != 2 {
+		t.Fatalf("Dropped() = %d, want 2 events dropped", got)
+	}
+
+	drainQuietly(t, w)
+
+	events := logAt(t, path)
+	if got := len(noticesIn(events)); got != 1 {
+		t.Fatalf("the log holds %d notices, want 1", got)
+	}
+	// The notice lands where the drain first noticed the gap rather than at the
+	// end, so it is found by looking for it. That is the point of it: the gap is
+	// marked where it is, not described later.
+	var notice Event
+	for _, ev := range events {
+		if ev.Notice != "" {
+			notice = ev
+		}
+	}
+	if want := "2 requests were not recorded"; notice.Notice != want {
+		t.Errorf("Notice = %q, want %q", notice.Notice, want)
+	}
+	// A notice is about the log, so it must not look like a request in the log.
+	if notice.Method != "" || notice.Path != "" || notice.Status != 0 {
+		t.Errorf("the notice looks like a request: %+v", notice)
+	}
+}
+
+func TestDropsAreAnnouncedOnceAndThenAgainOnlyWhenThereAreMore(t *testing.T) {
+	w, path := quietWriter(t, 1)
+
+	w.Observe(Event{Method: "GET", Status: 200})
+	w.Observe(Event{Method: "GET", Status: 200}) // dropped
+	w.noteDrops()
+	w.noteDrops() // nothing new to say
+
+	drainQuietly(t, w)
+
+	if got := noticesIn(logAt(t, path)); len(got) != 1 {
+		t.Errorf("the log holds %d notices, want 1 for a single batch of drops", len(got))
+	}
+}
+
+func TestASingleDroppedRequestIsAnnouncedInTheSingular(t *testing.T) {
+	w, path := quietWriter(t, 1)
+	w.Observe(Event{Method: "GET", Status: 200})
+	w.Observe(Event{Method: "GET", Status: 200}) // dropped
+
+	drainQuietly(t, w)
+
+	if got := logAt(t, path); len(got) == 0 {
+		t.Fatal("the log holds nothing, want the notice for what it lost")
+	} else if want := "1 request was not recorded"; got[len(got)-1].Notice != want {
+		t.Errorf("Notice = %q, want %q", got[len(got)-1].Notice, want)
+	}
+}
+
+func TestDropsAreAnnouncedEvenWhenNothingElseIsLeftToWrite(t *testing.T) {
+	w, path := quietWriter(t, 1)
+
+	// One event fits and the other two cannot, so nothing is left in the queue
+	// for the drain to notice a gap through.
+	for range 3 {
+		w.Observe(Event{Method: "GET", Status: 200})
+	}
+
+	drainQuietly(t, w)
+
+	got := noticesIn(logAt(t, path))
+	if len(got) == 0 {
+		t.Fatal("the log holds no notice, want it to admit what it lost as it closed")
+	}
+	if want := "2 requests were not recorded"; got[len(got)-1] != want {
+		t.Errorf("Notice = %q, want %q", got[len(got)-1], want)
+	}
+}
+
+func TestDropsAreCountedRunningRatherThanPerBatch(t *testing.T) {
+	w, path := quietWriter(t, 1)
+	for range 2 {
+		w.Observe(Event{Method: "GET", Status: 200}) // dropped
+	}
+	w.noteDrops()
+	w.Observe(Event{Method: "GET", Status: 200})
+	w.Observe(Event{Method: "GET", Status: 200}) // dropped
+	w.noteDrops()
+
+	drainQuietly(t, w)
+
+	got := noticesIn(logAt(t, path))
+	if len(got) != 2 {
+		t.Fatalf("the log holds %d notices, want one per batch", len(got))
+	}
+	// A gap in a log reads as "everything up to here is all of it", so the second
+	// notice has to carry the total so far. The second batch alone was two, so a
+	// notice saying two would leave the reader thinking nothing was lost before.
+	if want := "3 requests were not recorded"; got[1] != want {
+		t.Errorf("second Notice = %q, want %q", got[1], want)
+	}
+}
+
+func TestANoticeNeverCountsAsARequestInTheDashboard(t *testing.T) {
+	// The record has to survive the JSON round trip a watcher makes of it, since
+	// that is how every notice reaches one.
+	w, path := quietWriter(t, 1)
+	w.Observe(Event{Method: "GET", Status: 200})
+	w.Observe(Event{Method: "GET", Status: 200}) // dropped
+
+	drainQuietly(t, w)
+
+	for _, ev := range logAt(t, path) {
+		if ev.Notice != "" {
+			if ev.Status != 0 || ev.Method != "" || ev.Path != "" || ev.Latency != 0 {
+				t.Errorf("the notice carries request fields: %+v", ev)
+			}
+		}
 	}
 }

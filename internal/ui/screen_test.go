@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -81,6 +82,19 @@ func TestSizeReportsZeroesForAFileDescriptorThatIsNotATerminal(t *testing.T) {
 	// which is what keeps an unknown width from being read as a narrow one.
 	if w, h := size(-1); w != 0 || h != 0 {
 		t.Errorf("size(-1) = %d, %d, want zeroes", w, h)
+	}
+	// The descriptor a program really hands over is usually a valid one that
+	// simply is not a terminal, so that path matters as much as the guard.
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+	if w, h := size(int(reader.Fd())); w != 0 || h != 0 {
+		t.Errorf("size(pipe) = %d, %d, want zeroes", w, h)
 	}
 }
 

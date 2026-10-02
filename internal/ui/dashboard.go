@@ -86,6 +86,10 @@ type dashboard struct {
 	drawn int
 	// dropped reports how many requests the log could not deliver, if it knows.
 	dropped func() int
+	// notice is the latest thing the share has said about its own log, such as
+	// that it had to drop requests. It is kept apart from the requests so it
+	// cannot be counted as one, push one off the screen, or be a row of its own.
+	notice string
 }
 
 // run repaints until the context ends, the log ends, or the user quits.
@@ -194,6 +198,10 @@ func (d *dashboard) absorb(events <-chan reqlog.Event) {
 // the dashboard only ever looks at the tail.
 func (d *dashboard) push(events []reqlog.Event) {
 	for _, ev := range events {
+		if ev.Notice != "" {
+			d.notice = ev.Notice
+			continue
+		}
 		if len(d.events) == maxKept {
 			copy(d.events, d.events[1:])
 			d.events[maxKept-1] = ev
@@ -270,9 +278,23 @@ func (d *dashboard) render() {
 func (d *dashboard) header() []segment {
 	segs := []segment{{d.title, styleBold}, {"   ", stylePlain}}
 	if len(d.events) == 0 {
-		return append(segs, segment{"live", styleDim})
+		segs = append(segs, segment{"live", styleDim})
+	} else {
+		segs = append(segs, d.tally()...)
 	}
+	if d.notice != "" {
+		// A share admitting its log was short outranks every number on this
+		// line, so the notice stays until a later one replaces it.
+		segs = append(segs, segment{"   ", stylePlain}, segment{d.notice, styleYellow})
+	}
+	return segs
+}
 
+// tally is what the log has added up to: how many requests, how slow the slowest
+// was, and how many of them went wrong. The failures are the only number worth
+// tinting, since they are the reason a person is watching at all.
+func (d *dashboard) tally() []segment {
+	var segs []segment
 	segs = append(segs, segment{plural(len(d.events), "request"), styleDim})
 	if peak := slowest(d.events); peak > 0 {
 		segs = append(segs, segment{"   slowest " + latency(peak), styleDim})
@@ -380,6 +402,13 @@ func requestRow(ev reqlog.Event, layout rowLayout, peak time.Duration) []segment
 // place of a repainting screen. It is the same row the dashboard draws, without
 // the bar, so the two agree on every number.
 func (e *Env) RequestLine(ev reqlog.Event) string {
+	if ev.Notice != "" {
+		// A notice is about the log rather than part of it, so it is printed as
+		// it stands. Laying it out as a request would invent a method and a
+		// status it never had, and a piped watch would show a share telling you
+		// its log was short in the shape of a request that got a 200.
+		return ev.Notice
+	}
 	var sb strings.Builder
 	for _, seg := range requestRow(ev, rowLayout{}, 0) {
 		sb.WriteString(paint(e, seg.style, seg.text))
@@ -524,17 +553,17 @@ func pathOf(ev reqlog.Event) string {
 // for "/%1b[2J" would clear the screen of whoever is watching, and a newline in
 // a path would turn one served request into two lines of a piped log. The method
 // and the error text are escaped for the same reason, on the assumption that a
-// record can come from anywhere. Control characters are shown as the escapes they
-// already look like everywhere else in Go, which keeps the request readable
-// without obeying it.
+// record can come from anywhere. Characters that move the cursor or change how
+// the rest of the line reads are shown as the escapes they already look like
+// everywhere else in Go, which keeps the request readable without obeying it.
 func printable(s string) string {
-	if !strings.ContainsFunc(s, isControlRune) {
+	if !strings.ContainsFunc(s, isUnsafeRune) {
 		return s
 	}
 	var sb strings.Builder
 	sb.Grow(len(s) + 8)
 	for _, r := range s {
-		if isControlRune(r) {
+		if isUnsafeRune(r) {
 			// QuoteRuneToASCII always wraps in single quotes, so dropping them
 			// leaves the escape on its own.
 			quoted := strconv.QuoteRuneToASCII(r)
@@ -546,11 +575,36 @@ func printable(s string) string {
 	return sb.String()
 }
 
+// isUnsafeRune reports whether r would change what a terminal shows rather than
+// being part of what it shows.
+func isUnsafeRune(r rune) bool {
+	return isControlRune(r) || isBidiControl(r)
+}
+
 // isControlRune reports whether r moves the cursor or repaints the screen. It
 // covers C1 as well as C0, since a terminal in UTF-8 mode reads a raw 0x9b as the
 // start of a sequence just as it reads an escape byte.
 func isControlRune(r rune) bool {
 	return unicode.IsControl(r)
+}
+
+// isBidiControl reports whether r is a bidirectional override or isolate.
+//
+// These draw nothing themselves. A terminal in a right to left locale honours
+// them, so a path carrying U+202E is displayed with its characters in the
+// opposite order to the ones that were requested: what was asked for, and what
+// the watcher reads, stop being the same string. That is enough to dress up one
+// request as another, so they are escaped along with the escape sequences.
+func isBidiControl(r rune) bool {
+	switch {
+	case r == '\u061c': // ARABIC LETTER MARK
+	case r == '\u200e', r == '\u200f': // LEFT-TO-RIGHT MARK, RIGHT-TO-LEFT MARK
+	case r >= '\u202a' && r <= '\u202e': // embeddings and overrides
+	case r >= '\u2066' && r <= '\u2069': // isolates
+	default:
+		return false
+	}
+	return true
 }
 
 // trimPath shortens p to at most n cells, keeping the end: a path that is too

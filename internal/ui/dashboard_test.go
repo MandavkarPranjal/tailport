@@ -406,7 +406,7 @@ func TestBarsAreScaledAgainstTheSlowestRequestOnScreen(t *testing.T) {
 	if strings.Contains(frame, "/gone") {
 		t.Fatalf("frame = %q, want the slow request scrolled off", frame)
 	}
-	// Measured against the fastest of the three on screen, every bar is at least
+	// Measured against the slowest of the three on screen, every bar is at least
 	// half the width; measured against a request nobody can see, all three would
 	// shrink to a single cell and look like the same very slow request.
 	rows := barWidthsIn(frame)
@@ -863,5 +863,151 @@ func TestColumnsLineUpWhenAPathIsLongerOnceItIsEscaped(t *testing.T) {
 
 	if want := rowFixed + cells(printable(nasty.Path)) + rowBarWidth; cells(row) != want {
 		t.Errorf("row is %d cells wide, want %d so the columns still line up", cells(row), want)
+	}
+}
+
+func TestABidiOverrideCannotDisguiseWhatWasRequested(t *testing.T) {
+	env, _, _ := newEnv(t, "")
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "a right to left override reorders what is drawn", in: "/\u202egnp.exe", want: `\u202e`},
+		{name: "a left to right embed", in: "/\u202aetc", want: `\u202a`},
+		{name: "an isolate", in: "/\u2066etc", want: `\u2066`},
+		{name: "a pop directional format", in: "/\u202cetc", want: `\u202c`},
+		{name: "a left to right mark", in: "/\u200eetc", want: `\u200e`},
+		{name: "an arabic letter mark", in: "/\u061cetc", want: `\u061c`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ev := reqlog.Event{Method: "GET", Path: tt.in, Status: 200}
+
+			got := env.RequestLine(ev)
+
+			// A mark draws nothing, so it can reorder the characters around it
+			// without looking like it did anything at all.
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("RequestLine = %q, want the override spelled out as %q", got, tt.want)
+			}
+			if strings.ContainsRune(got, '\u202e') {
+				t.Errorf("RequestLine = %q, want no bidi override left to act on", got)
+			}
+		})
+	}
+}
+
+func TestABidiOverrideIsEscapedInTheMethodAndTheErrorToo(t *testing.T) {
+	env, _, _ := newEnv(t, "")
+	tests := []struct {
+		name string
+		ev   reqlog.Event
+	}{
+		{name: "a method", ev: reqlog.Event{Method: "GET\u202eX", Path: "/", Status: 200}},
+		{
+			name: "an error",
+			ev: reqlog.Event{
+				Method: "GET", Path: "/", Status: 502,
+				Latency: time.Millisecond, Error: "refused\u202eexe",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := env.RequestLine(tt.ev); strings.ContainsRune(got, '\u202e') {
+				t.Errorf("RequestLine = %q, want the override spelled out", got)
+			}
+		})
+	}
+}
+
+func TestANoticeFromTheShareIsShownRatherThanCountedAsARequest(t *testing.T) {
+	env, out, _ := newEnv(t, "")
+	d := &dashboard{env: env, title: "port 3000", fd: -1, width: 100, height: 12}
+	d.push([]reqlog.Event{
+		{Method: "GET", Path: "/a", Status: 200, Latency: 5 * time.Millisecond},
+		{Notice: "42 requests were not recorded"},
+		{Method: "GET", Path: "/b", Status: 200, Latency: 5 * time.Millisecond},
+	})
+
+	d.render()
+	frame := lastDashboardFrame(out)
+
+	if !strings.Contains(frame, "42 requests were not recorded") {
+		t.Errorf("frame = %q, want the share's notice about its own log", frame)
+	}
+	// The notice is about the log, so it must not inflate the request count or
+	// push a row off the screen.
+	if !strings.Contains(frame, "2 requests") {
+		t.Errorf("frame = %q, want only the two real requests counted", frame)
+	}
+	if !strings.Contains(frame, "/a") || !strings.Contains(frame, "/b") {
+		t.Errorf("frame = %q, want both requests still on screen", frame)
+	}
+	if strings.Contains(frame, "42 requests were not recorded\n") {
+		t.Errorf("frame = %q, want the notice on the header rather than as a row", frame)
+	}
+}
+
+func TestANoticeIsShownBeforeAnyRequestArrives(t *testing.T) {
+	env, out, _ := newEnv(t, "")
+	d := &dashboard{env: env, title: "port 3000", fd: -1, width: 100, height: 12}
+	d.push([]reqlog.Event{{Notice: "12 requests were not recorded"}})
+
+	d.render()
+	frame := lastDashboardFrame(out)
+
+	// The header has a "live" placeholder for a log with nothing in it, and that
+	// must not swallow a notice, which is the most important thing on the line
+	// when the share is dropping what it serves.
+	if !strings.Contains(frame, "12 requests were not recorded") {
+		t.Errorf("frame = %q, want the notice even though nothing has been served", frame)
+	}
+}
+
+func TestANewerNoticeReplacesTheOlderOne(t *testing.T) {
+	env, out, _ := newEnv(t, "")
+	d := &dashboard{env: env, title: "port 3000", fd: -1, width: 100, height: 12}
+	d.push([]reqlog.Event{{Notice: "12 requests were not recorded"}})
+	d.push([]reqlog.Event{{Method: "GET", Status: 200}})
+
+	d.render()
+	d.push([]reqlog.Event{{Notice: "30 requests were not recorded"}})
+	d.render()
+	frame := lastDashboardFrame(out)
+
+	if strings.Contains(frame, "12 requests were not recorded") {
+		t.Errorf("frame = %q, want the stale notice gone", frame)
+	}
+	if !strings.Contains(frame, "30 requests were not recorded") {
+		t.Errorf("frame = %q, want the current notice", frame)
+	}
+}
+
+func TestRequestLinePrintsANoticeOnItsOwn(t *testing.T) {
+	env, _, _ := newEnv(t, "")
+
+	got := env.RequestLine(reqlog.Event{Notice: "42 requests were not recorded"})
+
+	// Laid out as a request this would claim a method, a path and a 200 that
+	// never existed, and `watch | grep 502` would count it as a served request.
+	if got != "42 requests were not recorded" {
+		t.Errorf("RequestLine = %q, want the notice and nothing else", got)
+	}
+}
+
+func TestANoticeStillReachesAPipedWatcher(t *testing.T) {
+	env, out, _ := newEnv(t, "")
+	events := make(chan reqlog.Event, 1)
+	events <- reqlog.Event{Notice: "7 requests were not recorded"}
+	close(events)
+
+	if err := env.streamRequests(t.Context(), nil, events); err != nil {
+		t.Fatalf("streamRequests() error: %v", err)
+	}
+
+	if got := strings.TrimSpace(out.String()); got != "7 requests were not recorded" {
+		t.Errorf("output = %q, want the notice as its own line", got)
 	}
 }
